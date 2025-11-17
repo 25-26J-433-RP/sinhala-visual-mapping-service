@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  mindmap-api:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - .:/app
+    command: python app.py
