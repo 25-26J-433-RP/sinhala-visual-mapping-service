@@ -1,1 +1,258 @@
-# visual-mapping-model-training
+# Sinhala Mind Map Generator API
+
+A Python Flask backend API that generates graph-ready mind map data from Sinhala text. This API can process Sinhala paragraphs directly or fetch cleaned text from external APIs.
+
+## Features
+
+- ✨ Generate hierarchical mind map structures from Sinhala text
+- 🔄 Support for both direct text input and external API integration
+- 📊 Graph-ready output with nodes and edges
+- 🚀 Batch processing support
+- 🌐 CORS enabled for frontend integration
+- 🔍 RESTful API design
+
+## Installation
+
+### Prerequisites
+
+- Python 3.8 or higher
+- pip (Python package manager)
+
+### Setup
+
+1. Clone the repository:
+```bash
+git clone <repository-url>
+```
+
+2. Create a virtual environment:
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
+
+3. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+4. Configure environment variables:
+```bash
+cp .env.example .env
+# Edit .env file with your settings if needed
+```
+
+## Usage
+
+### Starting the API Server
+
+```bash
+python app.py
+```
+
+The API will start on `http://localhost:5000`
+
+### API Endpoints
+
+#### 1. Health Check
+```
+GET /health
+```
+
+**Response:**
+```json
+{
+  "status": "healthy",
+  "service": "Sinhala Mind Map Generator API"
+}
+```
+
+#### 2. Generate Mind Map (Direct Text)
+```
+POST /api/mindmap/generate
+```
+
+**Request Body:**
+```json
+{
+  "text": "ශ්‍රී ලංකාව දකුණු ආසියාවේ පිහිටි දිවයිනකි. එය සුන්දර වෙරළ තීරයන්, පුරාණ නටබුන් සහ පොහොසත් සංස්කෘතියකින් යුක්තය."
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "nodes": [
+      {
+        "id": "abc123",
+        "label": "ශ්‍රී ලංකාව දකුණු ආසියාවේ පිහිටි දිවයිනකි",
+        "level": 0,
+        "type": "root",
+        "size": 30
+      },
+      ...
+    ],
+    "edges": [
+      {
+        "id": "edge123",
+        "source": "abc123",
+        "target": "def456",
+        "type": "hierarchy"
+      },
+      ...
+    ],
+    "metadata": {
+      "total_nodes": 10,
+      "total_edges": 9,
+      "text_length": 150
+    }
+  }
+}
+```
+
+#### 3. Generate Mind Map (External API)
+```
+POST /api/mindmap/generate
+```
+
+**Request Body:**
+```json
+{
+  "external_api_url": "https://api.example.com/v1/text/cleaned",
+  "api_key": "your_api_key_here"
+}
+```
+
+The API will fetch data from the external URL and look for a `cleaned_text` field in the response.
+
+#### 4. Batch Generate Mind Maps
+```
+POST /api/mindmap/batch
+```
+
+**Request Body:**
+```json
+{
+  "texts": [
+    "පරිගණකය යනු ඉලෙක්ට්‍රොනික උපකරණයකි.",
+    "ශ්‍රී ලංකාව සංචාරක ගමනාන්ත සඳහා ප්‍රසිද්ධය."
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "nodes": [...],
+      "edges": [...],
+      "metadata": {...}
+    },
+    {
+      "nodes": [...],
+      "edges": [...],
+      "metadata": {...}
+    }
+  ]
+}
+```
+
+## Testing
+
+### Using curl
+
+```bash
+# Health check
+curl http://localhost:5000/health
+
+# Generate mind map
+curl -X POST http://localhost:5000/api/mindmap/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text": "ශ්‍රී ලංකාව දකුණු ආසියාවේ පිහිටි දිවයිනකි..."}'
+```
+
+### Using the test script
+
+```bash
+chmod +x test_api.sh
+./test_api.sh
+```
+
+
+
+## Output Format
+
+The API returns a graph-ready structure with:
+
+### Nodes
+Each node represents a concept with:
+- `id`: Unique identifier
+- `label`: Text content
+- `level`: Hierarchy level (0=root, 1=topic, 2=subtopic, 3=detail)
+- `type`: Node type (root, topic, subtopic, detail)
+- `size`: Visual size for rendering
+
+### Edges
+Each edge represents a relationship with:
+- `id`: Unique identifier
+- `source`: Source node ID
+- `target`: Target node ID
+- `type`: Relationship type (hierarchy, detail)
+
+## Configuration
+
+Edit `.env` file to customize:
+
+```env
+DEBUG=True
+HOST=0.0.0.0
+PORT=5000
+EXTERNAL_API_TIMEOUT=10
+MAX_NODES=100
+MAX_LEVELS=4
+CORS_ORIGINS=*
+```
+
+## Project Structure
+
+```
+visual-mapping-model-training/
+├── app.py                      # Main Flask application
+├── mindmap_generator.py        # Mind map generation logic
+├── config.py                   # Configuration settings
+├── requirements.txt            # Python dependencies
+├── .env.example               # Environment variables template
+├── .gitignore                 # Git ignore rules
+├── test_api.sh                # API test script
+└── README.md                  # This file
+```
+
+## Dependencies
+
+- Flask 3.0.0 - Web framework
+- Flask-CORS 4.0.0 - CORS support
+- requests 2.31.0 - HTTP library
+- python-dotenv 1.0.0 - Environment variables
+- spacy 3.7.2 - NLP library (for future enhancements)
+
+## Future Enhancements
+
+- [ ] Integration with Sinhala NLP models
+- [ ] Named entity recognition
+- [ ] Keyword extraction using TF-IDF
+- [ ] Custom graph layouts
+- [ ] Export to various formats (JSON, GraphML, etc.)
+- [ ] Authentication and rate limiting
+- [ ] Caching layer for improved performance
+
+## License
+
+See LICENSE file for details.
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
