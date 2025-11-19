@@ -270,5 +270,113 @@ def batch_generate_mindmap():
         }), 500
 
 
+@app.route('/api/mindmap/essay/<essay_id>', methods=['GET'])
+def get_mindmap_by_essay(essay_id):
+    """Retrieve a previously saved mindmap from Neo4j using the essay_id.
+
+    Returns the same graph-ready structure (nodes, edges, metadata) when available.
+    """
+    try:
+        if not neo4j_driver:
+            return jsonify({
+                'success': False,
+                'error': 'Neo4j is not configured on the server'
+            }), 400
+
+        nodes = []
+        edges = []
+        nodes_map = {}
+
+        with neo4j_driver.session(database=Config.NEO4J_DATABASE) as session:
+            # Fetch all nodes with the essay_id
+            node_records = session.run(
+                "MATCH (n:Concept {essay_id:$essay_id}) RETURN n",
+                essay_id=essay_id
+            )
+
+            for rec in node_records:
+                n = rec.get('n')
+                if not n:
+                    continue
+                nid = n.get('id') if 'id' in n else None
+                if nid in nodes_map:
+                    continue
+                node_obj = {
+                    'id': nid,
+                    'label': n.get('label'),
+                    'level': n.get('level'),
+                    'type': n.get('type'),
+                    'size': n.get('size')
+                }
+                nodes_map[nid] = node_obj
+
+            # Fetch edges among those nodes
+            edge_records = session.run(
+                "MATCH (s:Concept {essay_id:$essay_id})-[r]->(t:Concept {essay_id:$essay_id}) RETURN r,s,t",
+                essay_id=essay_id
+            )
+
+            for rec in edge_records:
+                r = rec.get('r')
+                s = rec.get('s')
+                t = rec.get('t')
+                if not (r and s and t):
+                    continue
+
+                sid = s.get('id')
+                tid = t.get('id')
+
+                # ensure source/target nodes are included
+                if sid not in nodes_map:
+                    nodes_map[sid] = {
+                        'id': sid,
+                        'label': s.get('label'),
+                        'level': s.get('level'),
+                        'type': s.get('type'),
+                        'size': s.get('size')
+                    }
+                if tid not in nodes_map:
+                    nodes_map[tid] = {
+                        'id': tid,
+                        'label': t.get('label'),
+                        'level': t.get('level'),
+                        'type': t.get('type'),
+                        'size': t.get('size')
+                    }
+
+                edge_obj = {
+                    'id': r.get('id'),
+                    'source': sid,
+                    'target': tid,
+                    'type': r.get('rel_type')
+                }
+                edges.append(edge_obj)
+
+        # Build nodes list from nodes_map
+        nodes = list(nodes_map.values())
+
+        metadata = {
+            'total_nodes': len(nodes),
+            'total_edges': len(edges),
+            'text_length': None
+        }
+
+        return jsonify({
+            'success': True,
+            'data': {
+                'nodes': nodes,
+                'edges': edges,
+                'metadata': metadata
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error retrieving mindmap from Neo4j: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

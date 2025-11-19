@@ -174,6 +174,31 @@ POST /api/mindmap/batch
 }
 ```
 
+#### 5. Retrieve Saved Mind Map by Essay ID
+```
+GET /api/mindmap/essay/<essay_id>
+```
+
+Fetches a previously saved mind map (nodes and edges) from the configured Neo4j database using the `essay_id` property.
+
+**Response:**
+```json
+{
+  "success": true,
+  "data": {
+    "nodes": [...],
+    "edges": [...],
+    "metadata": {
+      "total_nodes": 10,
+      "total_edges": 9,
+      "text_length": null
+    }
+  }
+}
+```
+
+Note: This endpoint requires Neo4j to be configured (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`). If Neo4j is not configured, the endpoint returns an error.
+
 ## Testing
 
 ### Using curl
