@@ -25,7 +25,7 @@ def print_section(title):
     print_separator()
     print()
 
-def test_mindmap_api(text, api_url='http://localhost:5000'):
+def run_mindmap_api(text, api_url='http://localhost:5000'):
     """
     Test the mind map API with given Sinhala text.
     
@@ -179,7 +179,7 @@ def main():
         sample_text = ' '.join(sys.argv[1:])
     
     # Run test
-    test_mindmap_api(sample_text)
+    run_mindmap_api(sample_text)
 
 
 if __name__ == '__main__':
