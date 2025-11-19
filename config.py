@@ -30,6 +30,13 @@ class Config:
     # CORS settings
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')
 
+    # Neo4j settings (optional). If `NEO4J_URI` is set, the app will attempt
+    # to connect and save generated mindmaps. Use `neo4j+s://...` for Aura.
+    NEO4J_URI = os.getenv('NEO4J_URI')
+    NEO4J_USER = os.getenv('NEO4J_USER')
+    NEO4J_PASSWORD = os.getenv('NEO4J_PASSWORD')
+    NEO4J_DATABASE = os.getenv('NEO4J_DATABASE', 'neo4j')
+
 
 class DevelopmentConfig(Config):
     """Development configuration."""

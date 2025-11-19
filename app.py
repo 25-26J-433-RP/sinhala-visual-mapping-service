@@ -8,6 +8,13 @@ from flask_cors import CORS
 import requests
 from mindmap_generator import SinhalaMindMapGenerator
 import logging
+from config import Config
+
+# Optional Neo4j
+try:
+    from neo4j import GraphDatabase
+except Exception:
+    GraphDatabase = None
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,6 +26,15 @@ CORS(app)  # Enable CORS for all routes
 
 # Initialize mind map generator
 mindmap_generator = SinhalaMindMapGenerator()
+
+# Initialize Neo4j driver if configured
+neo4j_driver = None
+if GraphDatabase and Config.NEO4J_URI and Config.NEO4J_USER and Config.NEO4J_PASSWORD:
+    try:
+        neo4j_driver = GraphDatabase.driver(Config.NEO4J_URI, auth=(Config.NEO4J_USER, Config.NEO4J_PASSWORD))
+        logger.info("Connected to Neo4j (driver initialized)")
+    except Exception as e:
+        logger.error(f"Failed to create Neo4j driver: {e}")
 
 
 @app.route('/health', methods=['GET'])
@@ -107,6 +123,59 @@ def generate_mindmap():
         # Generate mind map
         logger.info("Generating mind map from Sinhala text")
         mindmap_data = mindmap_generator.generate(sinhala_text)
+        # Save to Neo4j if available (best-effort)
+        if neo4j_driver:
+            try:
+                def _merge_node(tx, props):
+                    tx.run(
+                        """
+                        MERGE (n:Concept {id: $id})
+                        SET n += $props
+                        """,
+                        id=props['id'],
+                        props=props
+                    )
+
+                def _merge_edge(tx, params):
+                    tx.run(
+                        """
+                        MATCH (s:Concept {id: $source}), (t:Concept {id: $target})
+                        MERGE (s)-[r:REL {id: $id}]->(t)
+                        SET r.rel_type = $rel_type
+                        """,
+                        id=params['id'],
+                        source=params['source'],
+                        target=params['target'],
+                        rel_type=params.get('rel_type')
+                    )
+
+                with neo4j_driver.session(database=Config.NEO4J_DATABASE) as session:
+                    nodes = mindmap_data.get('nodes', [])
+                    edges = mindmap_data.get('edges', [])
+
+                    for node in nodes:
+                        props = {
+                            'id': node.get('id'),
+                            'label': node.get('label'),
+                            'level': node.get('level'),
+                            'type': node.get('type'),
+                            'size': node.get('size')
+                        }
+                        if essay_id:
+                            props['essay_id'] = essay_id
+                        session.execute_write(_merge_node, props)
+
+                    for edge in edges:
+                        params = {
+                            'id': edge.get('id'),
+                            'source': edge.get('source'),
+                            'target': edge.get('target'),
+                            'rel_type': edge.get('type')
+                        }
+                        session.execute_write(_merge_edge, params)
+
+            except Exception as e:
+                logger.error(f"Error saving mindmap to Neo4j: {e}")
         # Attach essay_id to response if provided
         response_payload = {
             'success': True,
