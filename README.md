@@ -75,6 +75,7 @@ POST /api/mindmap/generate
 **Request Body:**
 ```json
 {
+  "essay_id": "essay-12345",
   "text": "ශ්‍රී ලංකාව දකුණු ආසියාවේ පිහිටි දිවයිනකි. එය සුන්දර වෙරළ තීරයන්, පුරාණ නටබුන් සහ පොහොසත් සංස්කෘතියකින් යුක්තය."
 }
 ```
@@ -112,6 +113,16 @@ POST /api/mindmap/generate
 }
 ```
 
+Note: The response will include the provided `essay_id` at the top level when supplied, for example:
+
+```json
+{
+  "success": true,
+  "essay_id": "essay-12345",
+  "data": { ... }
+}
+```
+
 #### 3. Generate Mind Map (External API)
 ```
 POST /api/mindmap/generate
@@ -136,8 +147,8 @@ POST /api/mindmap/batch
 ```json
 {
   "texts": [
-    "පරිගණකය යනු ඉලෙක්ට්‍රොනික උපකරණයකි.",
-    "ශ්‍රී ලංකාව සංචාරක ගමනාන්ත සඳහා ප්‍රසිද්ධය."
+    {"essay_id": "e1", "text": "පරිගණකය යනු ඉලෙක්ට්‍රොනික උපකරණයකි."},
+    {"essay_id": "e2", "text": "ශ්‍රී ලංකාව සංචාරක ගමනාන්ත සඳහා ප්‍රසිද්ධය."}
   ]
 }
 ```
@@ -148,11 +159,13 @@ POST /api/mindmap/batch
   "success": true,
   "data": [
     {
+      "essay_id": "e1",
       "nodes": [...],
       "edges": [...],
       "metadata": {...}
     },
     {
+      "essay_id": "e2",
       "nodes": [...],
       "edges": [...],
       "metadata": {...}
