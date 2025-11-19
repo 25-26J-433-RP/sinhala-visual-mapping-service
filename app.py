@@ -65,6 +65,7 @@ def generate_mindmap():
         
         # Get text either directly or from external API
         sinhala_text = None
+        essay_id = data.get('essay_id') if isinstance(data, dict) else None
         
         if 'text' in data:
             sinhala_text = data['text']
@@ -84,7 +85,10 @@ def generate_mindmap():
                 external_data = response.json()
                 # Try to get cleaned_text field
                 sinhala_text = external_data.get('cleaned_text')
-                
+                # If external response includes an essay_id, prefer that
+                if not essay_id:
+                    essay_id = external_data.get('essay_id')
+
                 if not sinhala_text:
                     # Fallback to other possible fields
                     sinhala_text = external_data.get('text') or external_data.get('content')
@@ -103,11 +107,16 @@ def generate_mindmap():
         # Generate mind map
         logger.info("Generating mind map from Sinhala text")
         mindmap_data = mindmap_generator.generate(sinhala_text)
-        
-        return jsonify({
+        # Attach essay_id to response if provided
+        response_payload = {
             'success': True,
             'data': mindmap_data
-        }), 200
+        }
+
+        if essay_id:
+            response_payload['essay_id'] = essay_id
+
+        return jsonify(response_payload), 200
         
     except requests.RequestException as e:
         logger.error(f"Error fetching from external API: {str(e)}")
@@ -159,9 +168,25 @@ def batch_generate_mindmap():
             }), 400
         
         results = []
-        for text in texts:
-            mindmap_data = mindmap_generator.generate(text)
-            results.append(mindmap_data)
+        for item in texts:
+            # Support either string items or objects with text and optional essay_id
+            item_text = None
+            item_essay_id = None
+
+            if isinstance(item, dict):
+                item_text = item.get('text')
+                item_essay_id = item.get('essay_id')
+            else:
+                item_text = item
+
+            mindmap_data = mindmap_generator.generate(item_text)
+
+            # Attach essay_id to each result when available
+            result_entry = mindmap_data.copy()
+            if item_essay_id:
+                result_entry['essay_id'] = item_essay_id
+
+            results.append(result_entry)
         
         return jsonify({
             'success': True,
