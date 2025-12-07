@@ -5,6 +5,12 @@ import importlib.util
 
 import pytest
 
+# If Flask isn't installed in the environment running the tests, skip this module.
+try:
+    import flask  # noqa: F401
+except Exception:
+    pytest.skip("Flask is not installed; skipping neo4j save tests.", allow_module_level=True)
+
 
 # Load the app module from the project root
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
