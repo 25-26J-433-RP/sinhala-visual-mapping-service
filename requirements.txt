@@ -4,3 +4,11 @@ requests==2.31.0
 python-dotenv==1.0.0
 spacy==3.7.2
 neo4j==5.14.0
+
+# AI/ML libraries for intelligent node and relationship creation
+sentence-transformers==2.2.2
+numpy==1.24.3
+scikit-learn==1.3.2
+
+# Optional lightweight Sinhala NLP
+# sinling (if available via pip or install separately)
