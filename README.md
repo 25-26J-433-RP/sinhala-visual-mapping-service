@@ -1,15 +1,28 @@
 # Sinhala Mind Map Generator API
 
-A Python Flask backend API that generates graph-ready mind map data from Sinhala text. This API can process Sinhala paragraphs directly or fetch cleaned text from external APIs.
+A Python Flask backend API that generates graph-ready mind map data from Sinhala text with **AI-powered intelligent node and relationship creation**. This API can process Sinhala paragraphs directly or fetch cleaned text from external APIs.
+
+## ✨ New: AI-Powered Intelligent Generation
+
+**Now featuring lightweight AI models for enhanced mind map generation!**
+
+- 🤖 **AI-Powered Entity Extraction**: Automatically identifies important concepts using NLP
+- 🔗 **Intelligent Relationship Detection**: Discovers semantic connections between concepts
+- 📊 **Semantic Similarity Analysis**: Groups related concepts using multilingual embeddings
+- 🎯 **Importance Scoring**: Assigns relevance scores to nodes and relationships
+- 🌐 **Concept Clustering**: Organizes similar ideas automatically
 
 ## Features
 
 - ✨ Generate hierarchical mind map structures from Sinhala text
+- 🤖 **NEW**: Intelligent mode with AI-powered entity and relationship extraction
+- 🧠 **NEW**: Semantic analysis using lightweight multilingual models
 - 🔄 Support for both direct text input and external API integration
 - 📊 Graph-ready output with nodes and edges
 - 🚀 Batch processing support
 - 🌐 CORS enabled for frontend integration
 - 🔍 RESTful API design
+- 💾 Neo4j graph database integration
 
 ## Installation
 
@@ -35,6 +48,7 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```bash
 pip install -r requirements.txt
 ```
+
 
 4. Configure environment variables:
 ```bash
@@ -72,15 +86,26 @@ GET /health
 POST /api/mindmap/generate
 ```
 
-**Request Body:**
+**Request Body (Intelligent Mode - Default):**
 ```json
 {
-  "essay_id": "essay-12345",
-  "text": "ශ්‍රී ලංකාව දකුණු ආසියාවේ පිහිටි දිවයිනකි. එය සුන්දර වෙරළ තීරයන්, පුරාණ නටබුන් සහ පොහොසත් සංස්කෘතියකින් යුක්තය."
+  "text": "ශ්‍රී ලංකාව දකුණු ආසියාවේ පිහිටි දිවයිනකි. එය සුන්දර වෙරළ තීරයන්, පුරාණ නටබුන් සහ පොහොසත් සංස්කෘතියකින් යුක්තය.",
+  "intelligent": true,
+  "max_nodes": 50,
+  "semantic_clustering": true,
+  "relationship_threshold": 0.4
 }
 ```
 
-**Response:**
+**Request Parameters:**
+- `text` (string, required): Sinhala text to process
+- `essay_id` (string, optional): Identifier for tracking
+- `intelligent` (boolean, default: true): Use AI-powered generation
+- `max_nodes` (integer, default: 50): Maximum number of nodes
+- `semantic_clustering` (boolean, default: true): Enable concept clustering
+- `relationship_threshold` (float, default: 0.4): Minimum confidence for relationships
+
+**Response (Intelligent Mode):**
 ```json
 {
   "success": true,
@@ -88,38 +113,69 @@ POST /api/mindmap/generate
     "nodes": [
       {
         "id": "abc123",
-        "label": "ශ්‍රී ලංකාව දකුණු ආසියාවේ පිහිටි දිවයිනකි",
+        "label": "ශ්‍රී ලංකාව",
         "level": 0,
         "type": "root",
-        "size": 30
+        "size": 35,
+        "importance": 1.0,
+        "color": "#FF6B6B"
       },
-      ...
+      {
+        "id": "def456",
+        "label": "දකුණු ආසියාව",
+        "level": 1,
+        "type": "topic",
+        "size": 25,
+        "importance": 0.85,
+        "color": "#4ECDC4"
+      }
     ],
     "edges": [
       {
         "id": "edge123",
         "source": "abc123",
         "target": "def456",
-        "type": "hierarchy"
+        "type": "hierarchy",
+        "weight": 3
       },
-      ...
+      {
+        "id": "edge456",
+        "source": "def456",
+        "target": "ghi789",
+        "type": "semantic",
+        "weight": 2,
+        "confidence": 0.75,
+        "style": "dashed"
+      }
     ],
+    "metadata": {
+      "total_nodes": 25,
+      "total_edges": 32,
+      "entities_found": 18,
+      "relationships_found": 12,
+      "clusters": 5,
+      "text_length": 150,
+      "intelligence_level": "advanced"
+    }
+  }
+}
+```
+
+**Response (Basic Mode):**
+Set `"intelligent": false` to use the original rule-based generation.
+
+```json
+{
+  "success": true,
+  "data": {
+    "nodes": [...],
+    "edges": [...],
     "metadata": {
       "total_nodes": 10,
       "total_edges": 9,
       "text_length": 150
     }
   }
-}
-```
-
-Note: The response will include the provided `essay_id` at the top level when supplied, for example:
-
-```json
-{
-  "success": true,
-  "essay_id": "essay-12345",
-  "data": { ... }
 }
 ```
 
