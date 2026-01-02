@@ -6,7 +6,7 @@ This Flask application generates graph-ready mind map data from Sinhala text.
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
-from mindmap_generator import SinhalaMindMapGenerator
+from intelligent_mindmap_generator import IntelligentMindMapGenerator
 import logging
 from config import Config
 
@@ -24,8 +24,9 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
-# Initialize mind map generator
-mindmap_generator = SinhalaMindMapGenerator()
+# Initialize intelligent mind map generator (AI-powered only)
+intelligent_generator = IntelligentMindMapGenerator()
+logger.info("Initialized intelligent mind map generator with AI capabilities")
 
 # Initialize Neo4j driver if configured
 neo4j_driver = None
@@ -120,9 +121,15 @@ def generate_mindmap():
                 'error': 'No text provided. Please provide either "text" or "external_api_url"'
             }), 400
         
-        # Generate mind map
-        logger.info("Generating mind map from Sinhala text")
-        mindmap_data = mindmap_generator.generate(sinhala_text)
+        # Generate mind map using intelligent mode (AI-powered)
+        generation_options = {
+            'max_nodes': data.get('max_nodes', 50),
+            'semantic_clustering': data.get('semantic_clustering', True),
+            'relationship_threshold': data.get('relationship_threshold', 0.4)
+        }
+        
+        logger.info("Generating intelligent mind map with AI-powered node/relationship creation")
+        mindmap_data = intelligent_generator.generate(sinhala_text, generation_options)
         # Save to Neo4j if available (best-effort)
         if neo4j_driver:
             try:

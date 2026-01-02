@@ -27,6 +27,13 @@ class Config:
     MAX_NODES = int(os.getenv('MAX_NODES', 100))
     MAX_LEVELS = int(os.getenv('MAX_LEVELS', 4))
     
+    # AI/NLP settings for intelligent generation (enforced only mode)
+    USE_INTELLIGENT_MODE = True  # Always enabled
+    MIN_NODE_IMPORTANCE = float(os.getenv('MIN_NODE_IMPORTANCE', 0.3))
+    MIN_RELATIONSHIP_CONFIDENCE = float(os.getenv('MIN_RELATIONSHIP_CONFIDENCE', 0.4))
+    SEMANTIC_CLUSTERING = os.getenv('SEMANTIC_CLUSTERING', 'True').lower() == 'true'
+    EMBEDDINGS_MODEL = os.getenv('EMBEDDINGS_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2')
+    
     # CORS settings
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', '*')
 
