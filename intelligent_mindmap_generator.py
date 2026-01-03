@@ -5,6 +5,9 @@ Uses NLP engine for semantic understanding and intelligent graph construction.
 
 import uuid
 import logging
+import math
+import hashlib
+import re
 from typing import Dict, List, Any, Tuple
 from collections import defaultdict
 from nlp_engine import SinhalaNLPEngine
@@ -96,6 +99,9 @@ class IntelligentMindMapGenerator:
         # Step 6: Enhance with semantic connections
         if use_clustering:
             edges = self._add_semantic_edges(nodes, edges)
+
+        # Step 7: Assign deterministic positions for better layouts
+        nodes = self._assign_positions(nodes)
         
         logger.info(f"Generated graph with {len(nodes)} nodes and {len(edges)} edges")
         
@@ -130,6 +136,7 @@ class IntelligentMindMapGenerator:
         # Create root node from most important entity or first key phrase
         root_text = self._determine_root_topic(text, entities, key_phrases)
         root_id = self._generate_id()
+        root_offset = self._find_offset_in_text(text, root_text)
         
         nodes.append({
             'id': root_id,
@@ -138,7 +145,8 @@ class IntelligentMindMapGenerator:
             'type': 'root',
             'size': 35,
             'importance': 1.0,
-            'color': '#FF6B6B'
+            'color': '#FF6B6B',
+            'offset': root_offset
         })
         node_map[root_text] = root_id
         
@@ -154,7 +162,8 @@ class IntelligentMindMapGenerator:
                 'type': 'topic',
                 'size': 25,
                 'importance': node_data.get('importance', 0.7),
-                'color': '#4ECDC4'
+                'color': '#4ECDC4',
+                'offset': self._find_offset_in_text(text, node_data['text'])
             })
             node_map[node_data['text']] = node_id
             
@@ -169,7 +178,7 @@ class IntelligentMindMapGenerator:
         
         # Level 2: Subtopics from remaining entities
         level2_candidates = [e for e in entities if e['text'] not in node_map]
-        level2_nodes = sorted(level2_candidates, key=lambda x: x['importance'], reverse=True)
+        level2_nodes = sorted(level2_candidates, key=lambda x: (-(x.get('importance', 0)), x.get('offset', 0)))
         
         for entity in level2_nodes[:self.max_nodes_per_level[2]]:
             node_id = self._generate_id()
@@ -180,7 +189,8 @@ class IntelligentMindMapGenerator:
                 'type': 'subtopic',
                 'size': 18,
                 'importance': entity['importance'],
-                'color': '#95E1D3'
+                'color': '#95E1D3',
+                'offset': entity.get('offset', self._find_offset_in_text(text, entity['text']))
             })
             node_map[entity['text']] = node_id
             
@@ -214,7 +224,8 @@ class IntelligentMindMapGenerator:
                 'type': 'detail',
                 'size': 12,
                 'importance': item['importance'],
-                'color': '#F7DC6F'
+                'color': '#F7DC6F',
+                'offset': self._find_offset_in_text(text, item['text'])
             })
             node_map[item['text']] = node_id
             
@@ -229,26 +240,25 @@ class IntelligentMindMapGenerator:
                     'weight': 1
                 })
         
-        # Add relationship-based edges
+        # Add relationship-based edges with deduplication (undirected canonical key)
+        edge_keys = set()
         for rel in relationships:
             source_id = node_map.get(rel['source'])
             target_id = node_map.get(rel['target'])
             
             if source_id and target_id and source_id != target_id:
-                # Check if edge doesn't already exist
-                existing = any(
-                    e['source'] == source_id and e['target'] == target_id
-                    for e in edges
-                )
-                if not existing:
-                    edges.append({
-                        'id': self._generate_id(),
-                        'source': source_id,
-                        'target': target_id,
-                        'type': rel['type'],
-                        'weight': int(rel['confidence'] * 3),
-                        'confidence': rel['confidence']
-                    })
+                key = tuple(sorted([source_id, target_id]) + [rel['type']])
+                if key in edge_keys:
+                    continue
+                edge_keys.add(key)
+                edges.append({
+                    'id': self._generate_id(),
+                    'source': source_id,
+                    'target': target_id,
+                    'type': rel['type'],
+                    'weight': max(1, int(rel['confidence'] * 3)),
+                    'confidence': rel['confidence']
+                })
         
         return nodes, edges
     
@@ -383,6 +393,44 @@ class IntelligentMindMapGenerator:
                             })
         
         return enhanced_edges
+
+    def _assign_positions(self, nodes: List[Dict]) -> List[Dict]:
+        """Assign deterministic positions for nodes to make layouts stable per essay."""
+        if not nodes:
+            return nodes
+
+        # Group by level and sort deterministically by importance then text hash
+        levels = defaultdict(list)
+        for node in nodes:
+            levels[node['level']].append(node)
+
+        for level, level_nodes in levels.items():
+            level_nodes.sort(key=lambda n: (n.get('offset', 10**9), -n.get('importance', 0), self._stable_hash(n['label'])))
+            radius = 150 * (level + 1)
+            count = len(level_nodes)
+            for idx, node in enumerate(level_nodes):
+                angle = 2 * math.pi * idx / max(1, count) + 0.1 * level
+                node['position'] = {
+                    'x': round(radius * math.cos(angle), 2),
+                    'y': round(radius * math.sin(angle), 2)
+                }
+                node['order'] = idx
+
+        return nodes
+
+    def _stable_hash(self, text: str) -> int:
+        """Deterministic hash for layout ordering."""
+        return int(hashlib.md5(text.encode('utf-8')).hexdigest(), 16)
+
+    def _find_offset_in_text(self, text: str, phrase: str) -> int:
+        """Find the first occurrence offset of phrase within text."""
+        try:
+            match = re.search(re.escape(phrase), text)
+            if match:
+                return match.start()
+        except Exception:
+            pass
+        return 0
     
     def _empty_graph(self) -> Dict[str, Any]:
         """Return an empty graph structure."""

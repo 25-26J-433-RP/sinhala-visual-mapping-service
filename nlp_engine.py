@@ -4,6 +4,7 @@ Uses lightweight models for intelligent node and relationship extraction.
 """
 
 import re
+import hashlib
 from typing import List, Dict, Tuple, Set, Any
 import numpy as np
 from collections import defaultdict, Counter
@@ -52,10 +53,11 @@ class SinhalaNLPEngine:
         """
         entities = []
         
-        # Split text into sentences
-        sentences = self._split_sentences(text)
+        # Split text into sentences with character offsets for positional tracking
+        sentences = self._split_sentences_with_spans(text)
+        used_spans: List[Tuple[int, int]] = []
         
-        for sentence in sentences:
+        for sentence, sent_start in sentences:
             # Extract proper nouns (capitalized words in Sinhala context)
             words = sentence.split()
             
@@ -66,11 +68,15 @@ class SinhalaNLPEngine:
                     importance = self._calculate_word_importance(word, sentence, i, len(words))
                     
                     if importance > 0.3:
+                        # Track a stable character offset for this occurrence
+                        offset = self._find_offset(sentence, word, sent_start, used_spans)
+                        used_spans.append((offset, offset + len(word)))
                         entities.append({
                             'text': word,
                             'type': self._classify_entity_type(word, sentence),
                             'importance': importance,
-                            'context': sentence
+                            'context': sentence,
+                            'offset': offset
                         })
         
         # Deduplicate and sort by importance
@@ -85,13 +91,16 @@ class SinhalaNLPEngine:
             List of relationship dictionaries with source, target, type, and confidence
         """
         relationships = []
-        sentences = self._split_sentences(text)
-        
+        sentences = self._split_sentences_with_spans(text)
         entity_texts = {e['text'] for e in entities}
         
-        for sentence in sentences:
-            # Find entities in this sentence
-            sentence_entities = [e for e in entities if e['text'] in sentence]
+        for sentence, sent_start in sentences:
+            sent_end = sent_start + len(sentence)
+            # Find entities that fall inside this sentence span
+            sentence_entities = [
+                e for e in entities
+                if e.get('offset', -1) >= sent_start and e.get('offset', -1) < sent_end
+            ]
             
             if len(sentence_entities) >= 2:
                 # Extract relationships between entities in the same sentence
@@ -102,18 +111,29 @@ class SinhalaNLPEngine:
                         
                         # Determine relationship type and strength
                         rel_type, confidence = self._analyze_relationship(
-                            entity1['text'], entity2['text'], sentence
+                            entity1['text'], entity2['text'], sentence,
+                            entity1.get('offset'), entity2.get('offset')
                         )
                         
                         if confidence > 0.4:
-                            relationships.append({
-                                'source': entity1['text'],
-                                'target': entity2['text'],
-                                'type': rel_type,
-                                'confidence': confidence,
-                                'context': sentence
-                            })
+                            key = tuple(sorted([entity1['text'], entity2['text']]) + [rel_type])
+                            # Keep the strongest confidence for duplicate pairs
+                            existing = next((r for r in relationships if r.get('key') == key), None)
+                            if existing:
+                                existing['confidence'] = max(existing['confidence'], confidence)
+                            else:
+                                relationships.append({
+                                    'source': entity1['text'],
+                                    'target': entity2['text'],
+                                    'type': rel_type,
+                                    'confidence': confidence,
+                                    'context': sentence,
+                                    'key': key
+                                })
         
+        # Remove helper keys before returning
+        for r in relationships:
+            r.pop('key', None)
         return relationships
     
     def compute_semantic_similarity(self, text1: str, text2: str) -> float:
@@ -220,11 +240,27 @@ class SinhalaNLPEngine:
         return sorted_phrases[:max_phrases]
     
     def _split_sentences(self, text: str) -> List[str]:
-        """Split text into sentences."""
+        """Split text into sentences (legacy helper)."""
+        return [s for s, _ in self._split_sentences_with_spans(text)]
+
+    def _split_sentences_with_spans(self, text: str) -> List[Tuple[str, int]]:
+        """Split text into sentences and return (sentence, start_index)."""
         delimiters = ['.', '|', '?', '!', '।', ':', '\n']
         pattern = '|'.join(map(re.escape, delimiters))
-        sentences = re.split(pattern, text)
-        return [s.strip() for s in sentences if s.strip() and len(s.strip()) > 5]
+        sentences = []
+        start = 0
+        for match in re.finditer(pattern, text + ' '):  # add trailing space to catch last segment
+            end = match.start()
+            segment = text[start:end].strip()
+            if segment and len(segment) > 5:
+                sentences.append((segment, start))
+            start = match.end()
+        # Trailing text after last delimiter
+        if start < len(text):
+            tail = text[start:].strip()
+            if tail and len(tail) > 5:
+                sentences.append((tail, start))
+        return sentences
     
     def _calculate_word_importance(self, word: str, sentence: str, position: int, total_words: int) -> float:
         """Calculate importance score for a word."""
@@ -262,7 +298,8 @@ class SinhalaNLPEngine:
         else:
             return 'concept'
     
-    def _analyze_relationship(self, entity1: str, entity2: str, sentence: str) -> Tuple[str, float]:
+    def _analyze_relationship(self, entity1: str, entity2: str, sentence: str,
+                              offset1: int = None, offset2: int = None) -> Tuple[str, float]:
         """Analyze the relationship between two entities in a sentence."""
         # Find the text between entities
         idx1 = sentence.find(entity1)
@@ -278,21 +315,27 @@ class SinhalaNLPEngine:
         confidence = 0.5
         rel_type = 'related'
         
+        # Proximity boost: closer entities imply stronger link
+        if offset1 is not None and offset2 is not None:
+            distance = abs(offset1 - offset2)
+            proximity_score = max(0.0, 1.0 - min(distance, 200) / 200.0)  # clamp at 200 chars
+            confidence += 0.2 * proximity_score
+        
         # Check for specific relationship indicators
         if any(post in between for post in self.postpositions):
             rel_type = 'semantic'
-            confidence = 0.7
+            confidence += 0.2
         elif any(conn in between for conn in self.connectors):
             rel_type = 'conjunction'
-            confidence = 0.8
+            confidence += 0.3
         elif any(verb in between for verb in self.verbs_indicators):
             rel_type = 'action'
-            confidence = 0.75
+            confidence += 0.25
         elif len(between.split()) <= 3:
             rel_type = 'close'
-            confidence = 0.6
+            confidence += 0.1
         
-        return rel_type, confidence
+        return rel_type, min(confidence, 1.0)
     
     def _deduplicate_entities(self, entities: List[Dict]) -> List[Dict]:
         """Remove duplicate entities, keeping highest importance."""
@@ -366,3 +409,14 @@ class SinhalaNLPEngine:
         score += min(0.2, len(important_words) * 0.05)
         
         return min(1.0, score)
+
+    def _find_offset(self, sentence: str, word: str, sentence_start: int, used_spans: List[Tuple[int, int]]) -> int:
+        """Find a stable character offset for the word within the full text."""
+        pattern = re.escape(word)
+        for match in re.finditer(pattern, sentence):
+            start = sentence_start + match.start()
+            end = sentence_start + match.end()
+            if not any(us <= start < ue or us < end <= ue for us, ue in used_spans):
+                return start
+        # Fallback to sentence start if not found uniquely
+        return sentence_start
