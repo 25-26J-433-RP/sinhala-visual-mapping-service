@@ -11,6 +11,7 @@ import re
 from typing import Dict, List, Any, Tuple
 from collections import defaultdict
 from nlp_engine import SinhalaNLPEngine
+from config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +24,10 @@ class IntelligentMindMapGenerator:
     def __init__(self):
         """Initialize the intelligent generator."""
         self.nlp_engine = SinhalaNLPEngine()
-        self.min_node_importance = 0.3
-        self.min_relationship_confidence = 0.4
+        self.min_node_importance = getattr(Config, 'MIN_NODE_IMPORTANCE', 0.3)
+        self.min_relationship_confidence = getattr(Config, 'MIN_RELATIONSHIP_CONFIDENCE', 0.4)
+        self.default_max_nodes = getattr(Config, 'MAX_NODES', 50)
+        self.default_semantic_clustering = getattr(Config, 'SEMANTIC_CLUSTERING', True)
         self.max_nodes_per_level = {
             0: 1,   # Root
             1: 6,   # Main topics
@@ -46,18 +49,21 @@ class IntelligentMindMapGenerator:
         Returns:
             Dictionary with nodes, edges, and metadata
         """
-        if not text or not text.strip():
+        if not text or not str(text).strip():
             return self._empty_graph()
+
+        text = self._normalize_text(str(text))
         
         options = options or {}
-        max_nodes = options.get('max_nodes', 50)
-        use_clustering = options.get('semantic_clustering', True)
+        max_nodes = options.get('max_nodes', self.default_max_nodes)
+        use_clustering = options.get('semantic_clustering', self.default_semantic_clustering)
         rel_threshold = options.get('relationship_threshold', self.min_relationship_confidence)
         
         logger.info(f"Generating intelligent mind map for {len(text)} characters")
         
         # Step 1: Extract entities and concepts using NLP
         entities = self.nlp_engine.extract_entities(text)
+        entities = [e for e in entities if e.get('importance', 0) >= self.min_node_importance]
         logger.info(f"Extracted {len(entities)} entities")
         
         # Step 2: Extract key phrases for additional concepts
@@ -100,6 +106,10 @@ class IntelligentMindMapGenerator:
         if use_clustering:
             edges = self._add_semantic_edges(nodes, edges)
 
+        # Step 6b: Add cross-level semantic and proximity edges for richer context
+        edges = self._add_cross_level_semantic_edges(nodes, edges)
+        edges = self._add_proximity_edges(nodes, edges)
+
         # Step 7: Assign deterministic positions for better layouts
         nodes = self._assign_positions(nodes)
         
@@ -135,6 +145,7 @@ class IntelligentMindMapGenerator:
         
         # Create root node from most important entity or first key phrase
         root_text = self._determine_root_topic(text, entities, key_phrases)
+        root_text = self.nlp_engine.clean_label(root_text)  # Remove helping words
         root_id = self._generate_id()
         root_offset = self._find_offset_in_text(text, root_text)
         
@@ -155,9 +166,10 @@ class IntelligentMindMapGenerator:
         
         for i, node_data in enumerate(level1_nodes[:self.max_nodes_per_level[1]]):
             node_id = self._generate_id()
+            cleaned_label = self.nlp_engine.clean_label(node_data['text'])
             nodes.append({
                 'id': node_id,
-                'label': node_data['text'],
+                'label': cleaned_label,
                 'level': 1,
                 'type': 'topic',
                 'size': 25,
@@ -182,9 +194,10 @@ class IntelligentMindMapGenerator:
         
         for entity in level2_nodes[:self.max_nodes_per_level[2]]:
             node_id = self._generate_id()
+            cleaned_label = self.nlp_engine.clean_label(entity['text'])
             nodes.append({
                 'id': node_id,
-                'label': entity['text'],
+                'label': cleaned_label,
                 'level': 2,
                 'type': 'subtopic',
                 'size': 18,
@@ -217,9 +230,10 @@ class IntelligentMindMapGenerator:
                 break
             
             node_id = self._generate_id()
+            cleaned_label = self.nlp_engine.clean_label(item['text'])
             nodes.append({
                 'id': node_id,
-                'label': item['text'],
+                'label': cleaned_label,
                 'level': 3,
                 'type': 'detail',
                 'size': 12,
@@ -394,6 +408,79 @@ class IntelligentMindMapGenerator:
         
         return enhanced_edges
 
+    def _add_cross_level_semantic_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
+        """Connect semantically close nodes across adjacent levels for richer structure."""
+        enhanced = edges.copy()
+        similarity_threshold = 0.8
+        # Index nodes by level for quick lookup
+        by_level = defaultdict(list)
+        for node in nodes:
+            by_level[node['level']].append(node)
+
+        for level in range(0, 3):
+            lower = by_level.get(level)
+            upper = by_level.get(level + 1)
+            if not lower or not upper:
+                continue
+
+            for parent in lower:
+                for child in upper:
+                    # Skip if already connected
+                    exists = any(
+                        (e['source'] == parent['id'] and e['target'] == child['id']) or
+                        (e['source'] == child['id'] and e['target'] == parent['id'])
+                        for e in enhanced
+                    )
+                    if exists:
+                        continue
+
+                    similarity = self.nlp_engine.compute_semantic_similarity(parent['label'], child['label'])
+                    if similarity >= similarity_threshold:
+                        enhanced.append({
+                            'id': self._generate_id(),
+                            'source': parent['id'],
+                            'target': child['id'],
+                            'type': 'semantic_cross',
+                            'weight': 1,
+                            'similarity': similarity,
+                            'style': 'dotted'
+                        })
+        return enhanced
+
+    def _add_proximity_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
+        """Link nearby concepts based on text order to surface narrative flow."""
+        enhanced = edges.copy()
+        sorted_nodes = [n for n in nodes if 'offset' in n]
+        sorted_nodes.sort(key=lambda n: n.get('offset', 10**9))
+
+        for i, node in enumerate(sorted_nodes[:-1]):
+            neighbor = sorted_nodes[i + 1]
+
+            # Skip if already connected
+            exists = any(
+                (e['source'] == node['id'] and e['target'] == neighbor['id']) or
+                (e['source'] == neighbor['id'] and e['target'] == node['id'])
+                for e in enhanced
+            )
+            if exists:
+                continue
+
+            distance = abs(node.get('offset', 0) - neighbor.get('offset', 0))
+            if distance > 400:
+                continue
+
+            enhanced.append({
+                'id': self._generate_id(),
+                'source': node['id'],
+                'target': neighbor['id'],
+                'type': 'context',
+                'weight': 1,
+                'proximity': distance,
+                'style': 'dashed'
+            })
+
+        return enhanced
+
     def _assign_positions(self, nodes: List[Dict]) -> List[Dict]:
         """Assign deterministic positions for nodes to make layouts stable per essay."""
         if not nodes:
@@ -405,14 +492,25 @@ class IntelligentMindMapGenerator:
             levels[node['level']].append(node)
 
         for level, level_nodes in levels.items():
+            # Preserve reading order by offset, then importance
             level_nodes.sort(key=lambda n: (n.get('offset', 10**9), -n.get('importance', 0), self._stable_hash(n['label'])))
-            radius = 150 * (level + 1)
             count = len(level_nodes)
+            base_radius = 170 * (level + 1)
+            golden_angle = math.pi * (3 - math.sqrt(5))  # ~2.399963
+
             for idx, node in enumerate(level_nodes):
-                angle = 2 * math.pi * idx / max(1, count) + 0.1 * level
+                radius_scale = 1 + 0.12 * (count / 8)
+                radius = base_radius * radius_scale
+                angle = golden_angle * idx + 0.18 * level
+
+                # Add tiny deterministic jitter to avoid perfect overlaps
+                jitter = (self._stable_hash(node['id']) % 7) / 100.0
+                x = radius * math.cos(angle) * (1 + jitter)
+                y = radius * math.sin(angle) * (1 + jitter)
+
                 node['position'] = {
-                    'x': round(radius * math.cos(angle), 2),
-                    'y': round(radius * math.sin(angle), 2)
+                    'x': round(x, 2),
+                    'y': round(y, 2)
                 }
                 node['order'] = idx
 
@@ -454,3 +552,10 @@ class IntelligentMindMapGenerator:
     def _generate_id(self) -> str:
         """Generate a unique ID."""
         return str(uuid.uuid4())[:8]
+
+    def _normalize_text(self, text: str) -> str:
+        """Normalize control characters while preserving Sinhala-friendly spacing."""
+        cleaned = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]', ' ', text)
+        cleaned = re.sub(r'[ \t\r\f\v]+', ' ', cleaned)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        return cleaned.strip()

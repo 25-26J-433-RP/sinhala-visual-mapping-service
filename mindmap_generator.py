@@ -6,13 +6,16 @@ Processes Sinhala text and generates graph-ready mind map data.
 import re
 import uuid
 from typing import Dict, List, Any
-
+from nlp_engine import SinhalaNLPEngine
 
 class SinhalaMindMapGenerator:
     """Generates mind map structures from Sinhala text."""
     
     def __init__(self):
         """Initialize the mind map generator."""
+        # Initialize NLP engine for label cleaning
+        self.nlp_engine = SinhalaNLPEngine()
+        
         # Common Sinhala sentence endings and punctuation
         self.sentence_delimiters = [':', '|', '?', '!', '।', '\n']
         self.topic_keywords = ['විෂය', 'මාතෘකා', 'පාඩම', 'අංශය', 'කොටස']
@@ -66,6 +69,7 @@ class SinhalaMindMapGenerator:
         # Create root node from first significant phrase
         lines = text.strip().split('\n')
         root_text = self._extract_main_topic(lines[0] if lines else text[:100])
+        root_text = self.nlp_engine.clean_label(root_text)  # Remove helping words
         
         root_id = self._generate_id()
         nodes.append({
@@ -89,6 +93,7 @@ class SinhalaMindMapGenerator:
             # Create paragraph-level node
             para_id = self._generate_id()
             para_label = self._truncate_text(sentences[0] if sentences else paragraph, 50)
+            para_label = self.nlp_engine.clean_label(para_label)  # Remove helping words
             
             nodes.append({
                 'id': para_id,
@@ -113,6 +118,7 @@ class SinhalaMindMapGenerator:
                 
                 sentence_id = self._generate_id()
                 sentence_label = self._truncate_text(sentence, 40)
+                sentence_label = self.nlp_engine.clean_label(sentence_label)  # Remove helping words
                 
                 nodes.append({
                     'id': sentence_id,
@@ -134,10 +140,11 @@ class SinhalaMindMapGenerator:
                 
                 for k, phrase in enumerate(key_phrases[:2]):  # Max 2 details per subtopic
                     phrase_id = self._generate_id()
+                    cleaned_phrase = self.nlp_engine.clean_label(phrase)  # Remove helping words
                     
                     nodes.append({
                         'id': phrase_id,
-                        'label': phrase,
+                        'label': cleaned_phrase,
                         'level': 3,
                         'type': 'detail',
                         'size': 10
