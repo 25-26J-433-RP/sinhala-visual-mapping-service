@@ -28,6 +28,12 @@ class IntelligentMindMapGenerator:
         self.min_relationship_confidence = getattr(Config, 'MIN_RELATIONSHIP_CONFIDENCE', 0.4)
         self.default_max_nodes = getattr(Config, 'MAX_NODES', 50)
         self.default_semantic_clustering = getattr(Config, 'SEMANTIC_CLUSTERING', True)
+        self.max_edges_per_node = getattr(Config, 'MAX_EDGES_PER_NODE', 6)
+        self.max_total_edges = getattr(Config, 'MAX_TOTAL_EDGES', 160)
+        self.semantic_edges_per_node = getattr(Config, 'SEMANTIC_EDGES_PER_NODE', 2)
+        self.cross_edges_per_node = getattr(Config, 'CROSS_LEVEL_EDGES_PER_NODE', 2)
+        self.semantic_similarity_threshold = getattr(Config, 'SEMANTIC_SIMILARITY_THRESHOLD', 0.8)
+        self.cross_similarity_threshold = getattr(Config, 'CROSS_LEVEL_SIMILARITY_THRESHOLD', 0.82)
         self.max_nodes_per_level = {
             0: 1,   # Root
             1: 6,   # Main topics
@@ -58,6 +64,8 @@ class IntelligentMindMapGenerator:
         max_nodes = options.get('max_nodes', self.default_max_nodes)
         use_clustering = options.get('semantic_clustering', self.default_semantic_clustering)
         rel_threshold = options.get('relationship_threshold', self.min_relationship_confidence)
+        max_edges_per_node = options.get('max_edges_per_node', self.max_edges_per_node)
+        max_total_edges = options.get('max_total_edges', self.max_total_edges)
         
         logger.info(f"Generating intelligent mind map for {len(text)} characters")
         
@@ -109,6 +117,9 @@ class IntelligentMindMapGenerator:
         # Step 6b: Add cross-level semantic and proximity edges for richer context
         edges = self._add_cross_level_semantic_edges(nodes, edges)
         edges = self._add_proximity_edges(nodes, edges)
+
+        # Step 6c: Prune excess edges to reduce visual clutter
+        edges = self._prune_edges(nodes, edges, max_edges_per_node, max_total_edges)
 
         # Step 7: Assign deterministic positions for better layouts
         nodes = self._assign_positions(nodes)
@@ -363,55 +374,66 @@ class IntelligentMindMapGenerator:
         return best_parent
     
     def _add_semantic_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
-        """Add semantic similarity edges between related nodes at the same level."""
+        """Add a limited set of same-level semantic edges to avoid dense meshes."""
         enhanced_edges = edges.copy()
-        similarity_threshold = 0.7
-        
+        similarity_threshold = self.semantic_similarity_threshold
+        max_per_node = self.semantic_edges_per_node
+
         # Group nodes by level (excluding root)
         by_level = defaultdict(list)
         for node in nodes:
             if node['level'] > 0:
                 by_level[node['level']].append(node)
-        
-        # Add semantic edges within each level
+
+        # Add semantic edges within each level, capped per node
         for level, level_nodes in by_level.items():
             if len(level_nodes) < 2:
                 continue
-            
+
+            candidates = []
             for i in range(len(level_nodes)):
                 for j in range(i + 1, len(level_nodes)):
                     node1 = level_nodes[i]
                     node2 = level_nodes[j]
-                    
-                    # Check if edge already exists
-                    existing = any(
-                        (e['source'] == node1['id'] and e['target'] == node2['id']) or
-                        (e['source'] == node2['id'] and e['target'] == node1['id'])
-                        for e in enhanced_edges
+
+                    similarity = self.nlp_engine.compute_semantic_similarity(
+                        node1['label'], node2['label']
                     )
-                    
-                    if not existing:
-                        similarity = self.nlp_engine.compute_semantic_similarity(
-                            node1['label'], node2['label']
-                        )
-                        
-                        if similarity >= similarity_threshold:
-                            enhanced_edges.append({
-                                'id': self._generate_id(),
-                                'source': node1['id'],
-                                'target': node2['id'],
-                                'type': 'semantic',
-                                'weight': 1,
-                                'similarity': similarity,
-                                'style': 'dashed'
-                            })
-        
+
+                    if similarity >= similarity_threshold:
+                        candidates.append((similarity, node1, node2))
+
+            # Highest similarity pairs first
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            per_node_counts = defaultdict(int)
+
+            for similarity, node1, node2 in candidates:
+                if per_node_counts[node1['id']] >= max_per_node:
+                    continue
+                if per_node_counts[node2['id']] >= max_per_node:
+                    continue
+                if self._has_edge(enhanced_edges, node1['id'], node2['id']):
+                    continue
+
+                enhanced_edges.append({
+                    'id': self._generate_id(),
+                    'source': node1['id'],
+                    'target': node2['id'],
+                    'type': 'semantic',
+                    'weight': 1,
+                    'similarity': similarity,
+                    'style': 'dashed'
+                })
+                per_node_counts[node1['id']] += 1
+                per_node_counts[node2['id']] += 1
+
         return enhanced_edges
 
     def _add_cross_level_semantic_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
-        """Connect semantically close nodes across adjacent levels for richer structure."""
+        """Connect nearby levels with a small set of high-confidence semantic edges."""
         enhanced = edges.copy()
-        similarity_threshold = 0.8
+        similarity_threshold = self.cross_similarity_threshold
+        max_per_node = self.cross_edges_per_node
         # Index nodes by level for quick lookup
         by_level = defaultdict(list)
         for node in nodes:
@@ -423,28 +445,35 @@ class IntelligentMindMapGenerator:
             if not lower or not upper:
                 continue
 
+            candidates = []
             for parent in lower:
                 for child in upper:
-                    # Skip if already connected
-                    exists = any(
-                        (e['source'] == parent['id'] and e['target'] == child['id']) or
-                        (e['source'] == child['id'] and e['target'] == parent['id'])
-                        for e in enhanced
-                    )
-                    if exists:
-                        continue
-
                     similarity = self.nlp_engine.compute_semantic_similarity(parent['label'], child['label'])
                     if similarity >= similarity_threshold:
-                        enhanced.append({
-                            'id': self._generate_id(),
-                            'source': parent['id'],
-                            'target': child['id'],
-                            'type': 'semantic_cross',
-                            'weight': 1,
-                            'similarity': similarity,
-                            'style': 'dotted'
-                        })
+                        candidates.append((similarity, parent, child))
+
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            per_node_counts = defaultdict(int)
+
+            for similarity, parent, child in candidates:
+                if per_node_counts[parent['id']] >= max_per_node:
+                    continue
+                if per_node_counts[child['id']] >= max_per_node:
+                    continue
+                if self._has_edge(enhanced, parent['id'], child['id']):
+                    continue
+
+                enhanced.append({
+                    'id': self._generate_id(),
+                    'source': parent['id'],
+                    'target': child['id'],
+                    'type': 'semantic_cross',
+                    'weight': 1,
+                    'similarity': similarity,
+                    'style': 'dotted'
+                })
+                per_node_counts[parent['id']] += 1
+                per_node_counts[child['id']] += 1
         return enhanced
 
     def _add_proximity_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
@@ -552,6 +581,75 @@ class IntelligentMindMapGenerator:
     def _generate_id(self) -> str:
         """Generate a unique ID."""
         return str(uuid.uuid4())[:8]
+
+    def _has_edge(self, edges: List[Dict], source_id: str, target_id: str) -> bool:
+        """Check if an undirected edge already exists between two nodes."""
+        return any(
+            (edge['source'] == source_id and edge['target'] == target_id) or
+            (edge['source'] == target_id and edge['target'] == source_id)
+            for edge in edges
+        )
+
+    def _prune_edges(
+        self,
+        nodes: List[Dict],
+        edges: List[Dict],
+        max_edges_per_node: int,
+        max_total_edges: int
+    ) -> List[Dict]:
+        """Keep only the strongest non-hierarchical edges to reduce clutter."""
+        if not edges:
+            return edges
+
+        protected_types = {'hierarchy', 'detail'}
+        kept_edges: List[Dict] = []
+        per_node_counts = defaultdict(int)
+
+        # Always keep hierarchical structure edges
+        for edge in edges:
+            if edge.get('type') in protected_types:
+                kept_edges.append(edge)
+                per_node_counts[edge['source']] += 1
+                per_node_counts[edge['target']] += 1
+
+        # Make sure we never trim below the essential structure
+        budget = max(max_total_edges, len(kept_edges))
+
+        scored_edges = []
+        for edge in edges:
+            if edge in kept_edges:
+                continue
+
+            score = edge.get('weight', 1.0)
+            score += edge.get('confidence', 0)
+            score += edge.get('similarity', 0)
+
+            # Context/proximity edges are useful but should rank slightly lower
+            if edge.get('type') == 'context':
+                score -= 0.1
+
+            scored_edges.append((score, edge))
+
+        # Highest scoring optional edges first
+        scored_edges.sort(key=lambda item: item[0], reverse=True)
+
+        for score, edge in scored_edges:
+            if len(kept_edges) >= budget:
+                break
+
+            source = edge['source']
+            target = edge['target']
+
+            if per_node_counts[source] >= max_edges_per_node:
+                continue
+            if per_node_counts[target] >= max_edges_per_node:
+                continue
+
+            kept_edges.append(edge)
+            per_node_counts[source] += 1
+            per_node_counts[target] += 1
+
+        return kept_edges
 
     def _normalize_text(self, text: str) -> str:
         """Normalize control characters while preserving Sinhala-friendly spacing."""
