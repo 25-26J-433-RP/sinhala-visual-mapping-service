@@ -9,6 +9,7 @@ from typing import List, Dict, Tuple, Set, Any
 import numpy as np
 from collections import defaultdict, Counter
 import logging
+from config import Config
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +21,18 @@ class SinhalaNLPEngine:
         """Initialize the NLP engine with lightweight models."""
         self.embeddings_model = None
         self.sinling_available = False
+        self.embeddings_model_name = getattr(
+            Config, 'EMBEDDINGS_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2'
+        )
         
         # Initialize sentence transformer for semantic analysis
         try:
             from sentence_transformers import SentenceTransformer
             # Use a lightweight multilingual model that supports Sinhala
-            self.embeddings_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-            logger.info("Loaded multilingual embeddings model")
+            self.embeddings_model = SentenceTransformer(self.embeddings_model_name)
+            logger.info("Loaded multilingual embeddings model: %s", self.embeddings_model_name)
         except Exception as e:
-            logger.warning(f"Could not load embeddings model: {e}")
+            logger.warning("Could not load embeddings model %s: %s", self.embeddings_model_name, e)
         
         # Try to import sinling for Sinhala NLP
         try:
@@ -39,10 +43,39 @@ class SinhalaNLPEngine:
             logger.warning("Sinling not available, using fallback methods")
         
         # Sinhala linguistic patterns
-        self.postpositions = ['සඳහා', 'විසින්', 'ගැන', 'පිළිබඳව', 'අතර', 'තුළ', 'හි', 'සමග', 'සමඟ']
-        self.connectors = ['සහ', 'හා', 'මෙන්ම', 'ද', 'ඒ', 'වගේම', 'පමණක්']
-        self.verbs_indicators = ['කරන', 'වන', 'ඇති', 'යන', 'බව', 'නිසා', 'ලබන', 'දෙන']
+        self.postpositions = ['සඳහා', 'විසින්', 'ගැන', 'පිළිබඳව', 'අතර', 'තුළ', 'හි', 'සමග', 'සමඟ', 'සිට', 'දක්වා', 'වන්', 'වන', 'මගින්']
+        self.connectors = ['සහ', 'හා', 'මෙන්ම', 'ද', 'ඒ', 'වගේම', 'පමණක්', 'ඉතා', 'වඩා', 'මෙන්']
+        self.verbs_indicators = ['කරන', 'වන', 'ඇති', 'යන', 'බව', 'නිසා', 'ලබන', 'දෙන', 'වේ', 'වී', 'ගන්නා', 'දෙන']
+        
+        # Action verbs and weak words to filter (not pure concepts)
+        self.action_verbs = ['නිපදවන', 'ඉස්සරවන', 'ඇතිවේ', 'බිඳිනවා', 'හසුරුවන', 'ගිය', 'එන', 'යන', 'කරයි', 'කරණ', 'සිදු', 'ගිනේ']
+        self.weak_words = ['වුණු', 'වුණා', 'ඇතුළු', 'වන', 'වේ', 'වැයි', 'වෙයි', 'ඉතිරිය', 'ගුණඉංගිතවතුන්', 'ජීවිතයේ', 'කෝශවල', 'ප්‍රධාන', 'කොටස්ය']
+        
         self.question_words = ['කවර', 'කොහොමද', 'කුමක්', 'ඇයි', 'මොකද', 'කවදා', 'කොතැනද']
+        
+        # Comprehensive Sinhala stop words (helping words that should not appear in nodes)
+        self.stop_words = set([
+            # Pronouns
+            'මම', 'ඔබ', 'ඔහු', 'ඇය', 'අපි', 'ඔවුන්', 'මා', 'අප', 'ඔබට', 'මට',
+            # Articles and determiners
+            'එක්', 'එක', 'මේ', 'මෙම', 'ඒ', 'ඔය', 'ඕ', 'කිසිවක්', 'සියලු', 'සියළු',
+            # Common helping verbs
+            'වන', 'වන්නේ', 'වේ', 'වී', 'වෙයි', 'වුණා', 'වෙන්නේ', 'ඇති', 'ඇත', 'ඇත්තේ',
+            # Postpositions
+            'සඳහා', 'විසින්', 'ගැන', 'පිළිබඳව', 'අතර', 'තුළ', 'හි', 'සමග', 'සමඟ', 'සිට', 'දක්වා', 'මගින්',
+            # Conjunctions
+            'සහ', 'හා', 'මෙන්ම', 'ද', 'වගේම', 'පමණක්', 'නමුත්', 'කෙසේ', 'හෝ',
+            # Auxiliary words
+            'ඉතා', 'වඩා', 'මෙන්', 'තරම්', 'පමණ', 'ලෙස', 'ලෙසින්', 'යනාදී', 'ආදිය',
+            # Common particles
+            'ද', 'ය', 'ක්', 'යි', 'නේ', 'නේද', 'ඩ', 'නම්',
+            # Question particles
+            'කවර', 'කොහොමද', 'කුමක්', 'ඇයි', 'මොකද', 'කවදා', 'කොතැනද', 'කොහෙද',
+            # Modal particles  
+            'බව', 'නිසා', 'නම්', 'යැයි', 'කියා',
+            # Short common words
+            'ට', 'ටත්', 'යන', 'දී', 'ගේ', 'වල', 'ය', 'යි'
+        ])
         
     def extract_entities(self, text: str) -> List[Dict[str, Any]]:
         """
@@ -93,6 +126,7 @@ class SinhalaNLPEngine:
         relationships = []
         sentences = self._split_sentences_with_spans(text)
         entity_texts = {e['text'] for e in entities}
+        rel_keys = set()
         
         for sentence, sent_start in sentences:
             sent_end = sent_start + len(sentence)
@@ -130,6 +164,33 @@ class SinhalaNLPEngine:
                                     'context': sentence,
                                     'key': key
                                 })
+                            rel_keys.add(key)
+
+        # Add proximity-based cross-sentence/co-occurrence relationships for richer graphs
+        ordered_entities = [e for e in entities if e.get('offset') is not None]
+        ordered_entities.sort(key=lambda x: x.get('offset', 10**9))
+
+        for i, entity in enumerate(ordered_entities[:-1]):
+            for j in range(i + 1, min(i + 4, len(ordered_entities))):
+                other = ordered_entities[j]
+                if entity['text'] == other['text']:
+                    continue
+                # Distance-based confidence (closer concepts get higher weight)
+                distance = abs(entity.get('offset', 0) - other.get('offset', 0))
+                if distance > 400:  # limit to nearby co-occurrences
+                    break
+                confidence = max(0.45, 0.9 - (distance / 800.0))
+                key = tuple(sorted([entity['text'], other['text']]) + ['proximity'])
+                if key in rel_keys:
+                    continue
+                rel_keys.add(key)
+                relationships.append({
+                    'source': entity['text'],
+                    'target': other['text'],
+                    'type': 'proximity',
+                    'confidence': confidence,
+                    'context': 'proximity_window'
+                })
         
         # Remove helper keys before returning
         for r in relationships:
@@ -207,12 +268,13 @@ class SinhalaNLPEngine:
             return [[e] for e in entities]
     
     def extract_key_phrases(self, text: str, max_phrases: int = 10) -> List[Tuple[str, float]]:
+        """Extract key phrases with importance scores.
+
+        Prioritizes compound nouns and concept phrases for Sinhala text.
         """
-        Extract key phrases with importance scores.
-        
-        Returns:
-            List of (phrase, score) tuples
-        """
+        if not text:
+            return []
+
         sentences = self._split_sentences(text)
         phrases = []
         
@@ -222,11 +284,22 @@ class SinhalaNLPEngine:
             
             # Look for meaningful multi-word phrases
             for i in range(len(words)):
-                for j in range(i + 2, min(i + 6, len(words) + 1)):
+                # Check word at position i - skip if it's a stop word
+                if words[i] in self.stop_words or len(words[i]) <= 2:
+                    continue
+                
+                # Prefer 2-3 word phrases for compound nouns
+                for j in range(i + 2, min(i + 4, len(words) + 1)):
                     phrase = ' '.join(words[i:j])
                     
-                    if len(phrase) >= 10 and len(phrase) <= 80:
+                    # Filter out phrases that are mostly stop words
+                    if len(phrase) >= 8 and len(phrase) <= 80 and not self._is_stop_phrase(phrase):
                         score = self._calculate_phrase_importance(phrase, text)
+                        
+                        # Boost score for 2-word compound nouns (often concepts)
+                        if j - i == 2:  # 2-word phrase
+                            score *= 1.2
+                        
                         if score > 0.3:
                             phrases.append((phrase, score))
         
@@ -236,8 +309,20 @@ class SinhalaNLPEngine:
             if phrase not in phrase_dict or phrase_dict[phrase] < score:
                 phrase_dict[phrase] = score
         
-        sorted_phrases = sorted(phrase_dict.items(), key=lambda x: x[1], reverse=True)
-        return sorted_phrases[:max_phrases]
+        # Remove sub-phrases if better phrase exists
+        phrase_list = sorted(phrase_dict.items(), key=lambda x: x[1], reverse=True)
+        filtered_phrases = []
+        for phrase, score in phrase_list:
+            # Check if this phrase is already covered by a longer phrase
+            is_subphrase = False
+            for existing, _ in filtered_phrases:
+                if phrase in existing and len(existing) > len(phrase):
+                    is_subphrase = True
+                    break
+            if not is_subphrase:
+                filtered_phrases.append((phrase, score))
+        
+        return filtered_phrases[:max_phrases]
     
     def _split_sentences(self, text: str) -> List[str]:
         """Split text into sentences (legacy helper)."""
@@ -263,10 +348,24 @@ class SinhalaNLPEngine:
         return sentences
     
     def _calculate_word_importance(self, word: str, sentence: str, position: int, total_words: int) -> float:
-        """Calculate importance score for a word."""
-        # Check if it's a postposition or connector first (less important)
-        if word in self.postpositions or word in self.connectors:
-            return 0.0  # Return 0 to filter out completely
+        """Calculate importance score for a word. Prioritizes nouns over verbs."""
+        # Filter out stop words completely
+        if word in self.stop_words or word in self.postpositions or word in self.connectors:
+            return 0.0  # Return 0 to filter out helping words
+        
+        # Filter out action verbs and weak words (not pure concepts)
+        if word in self.action_verbs or word in self.weak_words:
+            return 0.0
+        
+        # Check if word contains verb patterns (lower importance)
+        if any(verb in word for verb in self.verbs_indicators):
+            # Words like 'නිපදවන' have verb endings, give lower importance
+            if word.endswith('න') or word.endswith('නවා') or word.endswith('ටන'):
+                return 0.2  # Very low importance for verb forms
+        
+        # Filter out very short words (likely particles)
+        if len(word) <= 2:
+            return 0.0
         
         score = 0.5  # Base score
         
@@ -278,20 +377,35 @@ class SinhalaNLPEngine:
         
         # Position factor (beginning and end of sentences often important)
         if position < 2 or position >= total_words - 2:
-            score += 0.1
-        
-        # Check if it's a verb indicator (context dependent)
-        if any(verb in word for verb in self.verbs_indicators):
-            score += 0.1
+            score += 0.15
         
         return min(1.0, max(0.0, score))
     
+    def _is_stop_phrase(self, phrase: str) -> bool:
+        """Check if phrase consists mainly of stop words."""
+        words = phrase.split()
+        if not words:
+            return True
+        
+        # Count how many words are stop words
+        stop_count = sum(1 for word in words if word in self.stop_words or len(word) <= 2)
+        
+        # If more than 60% are stop words, consider the phrase as a stop phrase
+        return stop_count / len(words) > 0.6
+    
     def _classify_entity_type(self, word: str, context: str) -> str:
         """Classify the type of entity."""
+        # Check if it's a weak word or action verb
+        if word in self.action_verbs or word in self.weak_words:
+            return 'verb'
+        
         # Simple classification based on patterns
         if any(q in context for q in self.question_words):
             return 'query'
         elif any(verb in word for verb in self.verbs_indicators):
+            # Check word ending for verb forms
+            if word.endswith('න') or word.endswith('ටන') or word.endswith('ෙයි'):
+                return 'verb'
             return 'action'
         elif word in self.postpositions:
             return 'relation'
@@ -338,11 +452,27 @@ class SinhalaNLPEngine:
         return rel_type, min(confidence, 1.0)
     
     def _deduplicate_entities(self, entities: List[Dict]) -> List[Dict]:
-        """Remove duplicate entities, keeping highest importance."""
+        """Remove duplicate entities, keeping highest importance.
+        
+        Also filters out pure verb forms and weak words.
+        """
         entity_dict = {}
         
         for entity in entities:
             text = entity['text']
+            
+            # Skip if it's a verb form or weak word
+            if text in self.action_verbs or text in self.weak_words:
+                continue
+            
+            # Skip if it's mostly verb
+            if text.endswith('න') or text.endswith('ටන') or text.endswith('ෙයි'):
+                # But allow if it's a well-known concept
+                if text not in ['නිපදවන', 'ඉස්සරවන', 'ඇතිවේ', 'බිඳිනවා']:
+                    if text not in entity_dict or entity_dict[text]['importance'] < entity['importance']:
+                        entity_dict[text] = entity
+                continue
+            
             if text not in entity_dict or entity_dict[text]['importance'] < entity['importance']:
                 entity_dict[text] = entity
         
@@ -360,6 +490,29 @@ class SinhalaNLPEngine:
         union = len(words1 | words2)
         
         return intersection / union if union > 0 else 0.0
+    
+    def clean_label(self, text: str) -> str:
+        """Remove stop words from text to show only concepts."""
+        if not text or not text.strip():
+            return text
+            
+        words = text.split()
+        # Filter out stop words and very short words
+        cleaned_words = [
+            word for word in words 
+            if word not in self.stop_words 
+            and len(word) > 2
+            and word not in self.postpositions
+            and word not in self.connectors
+        ]
+        
+        # If all words were filtered out, keep longest words as fallback
+        if not cleaned_words:
+            # Sort by length and keep the longest ones
+            words_by_length = sorted(words, key=len, reverse=True)
+            cleaned_words = words_by_length[:min(3, len(words_by_length))]
+        
+        return ' '.join(cleaned_words)
     
     def _simple_cluster(self, entities: List[Dict]) -> List[List[Dict]]:
         """Simple clustering based on text patterns."""

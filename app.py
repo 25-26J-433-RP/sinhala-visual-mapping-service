@@ -28,6 +28,16 @@ CORS(app)  # Enable CORS for all routes
 intelligent_generator = IntelligentMindMapGenerator()
 logger.info("Initialized intelligent mind map generator with AI capabilities")
 
+
+def build_generation_options(payload: dict) -> dict:
+    """Construct generation options using request overrides and Config defaults."""
+    payload = payload or {}
+    return {
+        'max_nodes': payload.get('max_nodes', Config.MAX_NODES),
+        'semantic_clustering': payload.get('semantic_clustering', Config.SEMANTIC_CLUSTERING),
+        'relationship_threshold': payload.get('relationship_threshold', Config.MIN_RELATIONSHIP_CONFIDENCE)
+    }
+
 # Initialize Neo4j driver if configured
 neo4j_driver = None
 if GraphDatabase and Config.NEO4J_URI and Config.NEO4J_USER and Config.NEO4J_PASSWORD:
@@ -86,6 +96,11 @@ def generate_mindmap():
         
         if 'text' in data:
             sinhala_text = data['text']
+            if not isinstance(sinhala_text, str):
+                return jsonify({
+                    'success': False,
+                    'error': '"text" must be a string'
+                }), 400
             logger.info("Received direct text input")
         elif 'external_api_url' in data:
             # Fetch from external API
@@ -122,11 +137,7 @@ def generate_mindmap():
             }), 400
         
         # Generate mind map using intelligent mode (AI-powered)
-        generation_options = {
-            'max_nodes': data.get('max_nodes', 50),
-            'semantic_clustering': data.get('semantic_clustering', True),
-            'relationship_threshold': data.get('relationship_threshold', 0.4)
-        }
+        generation_options = build_generation_options(data)
         
         logger.info("Generating intelligent mind map with AI-powered node/relationship creation")
         mindmap_data = intelligent_generator.generate(sinhala_text, generation_options)
@@ -248,14 +259,28 @@ def batch_generate_mindmap():
             # Support either string items or objects with text and optional essay_id
             item_text = None
             item_essay_id = None
+            item_options = {}
 
             if isinstance(item, dict):
                 item_text = item.get('text')
                 item_essay_id = item.get('essay_id')
+                item_options = item
             else:
                 item_text = item
+                item_options = {}
 
-            mindmap_data = mindmap_generator.generate(item_text)
+            if not isinstance(item_text, str) or not item_text.strip():
+                empty_graph = intelligent_generator._empty_graph()
+                result_entry = {
+                    **empty_graph,
+                    'essay_id': item_essay_id,
+                    'error': 'Invalid or empty text provided'
+                }
+                results.append(result_entry)
+                continue
+
+            generation_options = build_generation_options(item_options)
+            mindmap_data = intelligent_generator.generate(item_text, generation_options)
 
             # Attach essay_id to each result when available
             result_entry = mindmap_data.copy()
