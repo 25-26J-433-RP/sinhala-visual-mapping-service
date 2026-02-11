@@ -246,22 +246,26 @@ class SinhalaNLPEngine:
                                 })
                             rel_keys.add(key)
 
-        # Add proximity-based cross-sentence/co-occurrence relationships for richer graphs
+        # Add proximity-based cross-sentence/co-occurrence relationships (LIMITED for cleaner graphs)
+        # REDUCED: Only add very close proximity relationships to avoid clutter
         ordered_entities = [e for e in entities if e.get('offset') is not None]
         ordered_entities.sort(key=lambda x: x.get('offset', 10**9))
 
         for i, entity in enumerate(ordered_entities[:-1]):
-            for j in range(i + 1, min(i + 4, len(ordered_entities))):
+            # REDUCED: Only check next 2 entities instead of 4
+            for j in range(i + 1, min(i + 2, len(ordered_entities))):
                 other = ordered_entities[j]
                 if entity['text'] == other['text']:
                     continue
-                if self.compute_semantic_similarity(entity['text'], other['text']) < 0.15:
+                # INCREASED threshold from 0.15 to 0.4 to be more selective
+                if self.compute_semantic_similarity(entity['text'], other['text']) < 0.4:
                     continue
                 # Distance-based confidence (closer concepts get higher weight)
                 distance = abs(entity.get('offset', 0) - other.get('offset', 0))
-                if distance > 400:  # limit to nearby co-occurrences
+                # REDUCED: limit to very nearby co-occurrences (100 instead of 400)
+                if distance > 100:
                     break
-                confidence = max(0.45, 0.9 - (distance / 800.0))
+                confidence = max(0.5, 0.95 - (distance / 200.0))
                 key = tuple(sorted([entity['text'], other['text']]) + ['proximity'])
                 if key in rel_keys:
                     continue

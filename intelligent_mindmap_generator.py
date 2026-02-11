@@ -128,6 +128,9 @@ class IntelligentMindMapGenerator:
         edges = self._add_cross_level_semantic_edges(nodes, edges)
         edges = self._add_proximity_edges(nodes, edges)
 
+        # Step 6c: CRITICAL - Deduplicate edges to show only one line between any two nodes
+        edges = self._deduplicate_edges(edges)
+
         # Step 7: Assign deterministic positions for better layouts
         nodes = self._assign_positions(nodes)
         
@@ -185,9 +188,13 @@ class IntelligentMindMapGenerator:
         # Level 1: Main topics from clusters or top entities
         level1_nodes = self._create_main_topics(clusters, entities, key_phrases, max_nodes)
         
+        # Branch colors for visual distinction
+        branch_colors = ['#4ECDC4', '#95E1D3', '#F38181', '#FFA07A', '#98D8C8']
+        
         for i, node_data in enumerate(level1_nodes[:self.max_nodes_per_level[1]]):
             node_id = self._generate_id()
-            cleaned_label = self.nlp_engine.clean_label(node_data['text'])
+            # Keep label clean but preserve meaning
+            cleaned_label = self._clean_label_preserving(node_data['text'])
             nodes.append({
                 'id': node_id,
                 'label': cleaned_label,
@@ -195,7 +202,7 @@ class IntelligentMindMapGenerator:
                 'type': 'topic',
                 'size': 25,
                 'importance': node_data.get('importance', 0.7),
-                'color': '#4ECDC4',
+                'color': branch_colors[i % len(branch_colors)],
                 'offset': self._find_offset_in_text(text, node_data['text']),
                 'source_text': node_data['text'],
                 'source_type': node_data.get('source_type', 'entity')
@@ -217,7 +224,17 @@ class IntelligentMindMapGenerator:
         
         for entity in level2_nodes[:self.max_nodes_per_level[2]]:
             node_id = self._generate_id()
-            cleaned_label = self.nlp_engine.clean_label(entity['text'])
+            # Preserve label integrity for subtopics
+            cleaned_label = self._clean_label_preserving(entity['text'])
+            
+            # Match parent's color for branch consistency
+            parent_id = self._find_best_parent(entity, nodes, level=1, cluster_map=cluster_map)
+            parent_color = '#95E1D3'
+            if parent_id:
+                parent_node = next((n for n in nodes if n['id'] == parent_id), None)
+                if parent_node:
+                    parent_color = parent_node['color']
+            
             nodes.append({
                 'id': node_id,
                 'label': cleaned_label,
@@ -225,7 +242,7 @@ class IntelligentMindMapGenerator:
                 'type': 'subtopic',
                 'size': 18,
                 'importance': entity['importance'],
-                'color': '#95E1D3',
+                'color': parent_color,
                 'offset': entity.get('offset', self._find_offset_in_text(text, entity['text'])),
                 'source_text': entity['text'],
                 'source_type': entity.get('type', 'entity')
@@ -437,22 +454,33 @@ class IntelligentMindMapGenerator:
         key_phrases: List[Tuple[str, float]]
     ) -> str:
         """Determine the root topic for the mind map."""
-        # Prefer strong entities near the beginning of the text
+        # Prefer the FIRST entity (usually the main subject) in the first sentence
         if entities:
             text_len = max(1, len(text))
+            # Focus on entities in first 25% of text
+            first_sentence_end = text.find('.') if '.' in text else int(text_len * 0.25)
             early_entities = [
                 e for e in entities
-                if e.get('offset', text_len) <= int(text_len * 0.35)
+                if e.get('offset', text_len) <= first_sentence_end
             ]
             if early_entities:
-                early_entities.sort(key=lambda x: (-(x.get('importance', 0)), x.get('offset', 0)))
+                # Sort by offset first (earlier = better), then importance
+                early_entities.sort(key=lambda x: (x.get('offset', 0), -(x.get('importance', 0))))
+                # Prefer proper nouns or location types
+                for e in early_entities[:3]:
+                    if e.get('type') in ['proper_noun', 'location', 'concept']:
+                        return e['text']
                 return early_entities[0]['text']
-            entities.sort(key=lambda x: (-(x.get('importance', 0)), x.get('offset', 0)))
+            entities.sort(key=lambda x: (x.get('offset', 0), -(x.get('importance', 0))))
             return entities[0]['text']
 
         # Try to extract from first sentence
         first_sentence = text.split('.')[0].strip()
         if first_sentence and len(first_sentence) < 100:
+            # Extract first meaningful noun phrase
+            words = first_sentence.split()
+            if len(words) >= 2:
+                return ' '.join(words[:2])
             return self._truncate_text(first_sentence, 80)
         
         # Use top key phrase
@@ -577,8 +605,9 @@ class IntelligentMindMapGenerator:
     def _add_semantic_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
         """Add semantic similarity edges between related nodes at the same level."""
         enhanced_edges = edges.copy()
-        similarity_threshold = 0.75
-        max_edges_per_node = 2
+        # Stricter threshold for cleaner visualization
+        similarity_threshold = 0.85
+        max_edges_per_node = 1  # Reduced from 2
         
         # Group nodes by level (excluding root)
         by_level = defaultdict(list)
@@ -586,9 +615,9 @@ class IntelligentMindMapGenerator:
             if node['level'] > 0:
                 by_level[node['level']].append(node)
         
-        # Add semantic edges within each level
+        # Add semantic edges within each level (only for level 2+ to reduce clutter)
         for level, level_nodes in by_level.items():
-            if len(level_nodes) < 2:
+            if len(level_nodes) < 2 or level < 2:  # Skip level 1
                 continue
 
             for i in range(len(level_nodes)):
@@ -629,82 +658,62 @@ class IntelligentMindMapGenerator:
 
     def _add_cross_level_semantic_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
         """Connect semantically close nodes across adjacent levels for richer structure."""
-        enhanced = edges.copy()
-        similarity_threshold = 0.82
-        max_edges_per_parent = 2
-        # Index nodes by level for quick lookup
-        by_level = defaultdict(list)
-        for node in nodes:
-            by_level[node['level']].append(node)
-
-        for level in range(0, 3):
-            lower = by_level.get(level)
-            upper = by_level.get(level + 1)
-            if not lower or not upper:
-                continue
-
-            for parent in lower:
-                candidates = []
-                for child in upper:
-                    # Skip if already connected
-                    exists = any(
-                        (e['source'] == parent['id'] and e['target'] == child['id']) or
-                        (e['source'] == child['id'] and e['target'] == parent['id'])
-                        for e in enhanced
-                    )
-                    if exists:
-                        continue
-
-                    similarity = self.nlp_engine.compute_semantic_similarity(parent['label'], child['label'])
-                    if similarity >= similarity_threshold:
-                        candidates.append((similarity, child))
-
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                for similarity, child in candidates[:max_edges_per_parent]:
-                    enhanced.append({
-                        'id': self._generate_id(),
-                        'source': parent['id'],
-                        'target': child['id'],
-                        'type': 'semantic_cross',
-                        'weight': 1,
-                        'similarity': similarity,
-                        'style': 'dotted'
-                    })
-        return enhanced
+        # DISABLED: Too many cross-level edges create visual clutter
+        # For cleaner mind maps, rely on hierarchical edges only
+        return edges
 
     def _add_proximity_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
         """Link nearby concepts based on text order to surface narrative flow."""
-        enhanced = edges.copy()
-        sorted_nodes = [n for n in nodes if 'offset' in n]
-        sorted_nodes.sort(key=lambda n: n.get('offset', 10**9))
+        # DISABLED: Proximity edges create too much clutter
+        # For cleaner visualization, use hierarchy only
+        return edges
 
-        for i, node in enumerate(sorted_nodes[:-1]):
-            neighbor = sorted_nodes[i + 1]
-
-            # Skip if already connected
-            exists = any(
-                (e['source'] == node['id'] and e['target'] == neighbor['id']) or
-                (e['source'] == neighbor['id'] and e['target'] == node['id'])
-                for e in enhanced
-            )
-            if exists:
-                continue
-
-            distance = abs(node.get('offset', 0) - neighbor.get('offset', 0))
-            if distance > 400:
-                continue
-
-            enhanced.append({
-                'id': self._generate_id(),
-                'source': node['id'],
-                'target': neighbor['id'],
-                'type': 'context',
-                'weight': 1,
-                'proximity': distance,
-                'style': 'dashed'
-            })
-
-        return enhanced
+    def _deduplicate_edges(self, edges: List[Dict]) -> List[Dict]:
+        """
+        Ensure only ONE edge exists between any two nodes.
+        Keeps the most important edge based on type priority and weight.
+        """
+        if not edges:
+            return edges
+        
+        # Priority: hierarchy > semantic > other types
+        type_priority = {
+            'hierarchy': 10,
+            'semantic': 5,
+            'semantic_cross': 4,
+            'proximity': 3,
+            'close': 2,
+            'conjunction': 2,
+            'action': 2
+        }
+        
+        # Group edges by node pairs (undirected)
+        edge_groups = {}
+        for edge in edges:
+            source = edge['source']
+            target = edge['target']
+            # Create canonical key (sorted to handle both directions)
+            pair_key = tuple(sorted([source, target]))
+            
+            if pair_key not in edge_groups:
+                edge_groups[pair_key] = []
+            edge_groups[pair_key].append(edge)
+        
+        # For each pair, keep only the best edge
+        deduplicated = []
+        for pair_key, pair_edges in edge_groups.items():
+            if len(pair_edges) == 1:
+                deduplicated.append(pair_edges[0])
+            else:
+                # Score each edge and keep the best
+                best_edge = max(pair_edges, key=lambda e: (
+                    type_priority.get(e.get('type', ''), 1),
+                    e.get('weight', 1),
+                    e.get('confidence', 0.5)
+                ))
+                deduplicated.append(best_edge)
+        
+        return deduplicated
 
     def _assign_positions(self, nodes: List[Dict]) -> List[Dict]:
         """Assign deterministic positions for nodes to make layouts stable per essay."""
@@ -754,6 +763,39 @@ class IntelligentMindMapGenerator:
         except Exception:
             pass
         return 0
+    
+    def _clean_label_preserving(self, text: str) -> str:
+        """Clean label while preserving Sinhala text integrity and meaning."""
+        if not text or not text.strip():
+            return text
+        
+        # Normalize unicode but preserve Sinhala characters
+        text = unicodedata.normalize('NFC', text)
+        text = text.strip()
+        
+        # Only remove obvious noise, keep meaningful Sinhala words
+        words = text.split()
+        
+        # Filter strategy: keep all non-empty words unless they're pure stop words
+        cleaned_words = []
+        for word in words:
+            word = word.strip()
+            # Skip empty or very short noise
+            if len(word) <= 1:
+                continue
+            # Keep if not in stop word list or if it's substantial (>3 chars)
+            if word not in self.nlp_engine.stop_words or len(word) > 3:
+                cleaned_words.append(word)
+        
+        # If we filtered everything, keep original
+        if not cleaned_words:
+            return text
+        
+        # Limit to 4 words max for readability
+        result = ' '.join(cleaned_words[:4])
+        
+        # Ensure we didn't accidentally create an empty label
+        return result if result.strip() else text
     
     def _empty_graph(self) -> Dict[str, Any]:
         """Return an empty graph structure."""
