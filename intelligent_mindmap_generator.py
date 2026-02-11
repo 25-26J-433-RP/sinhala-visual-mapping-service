@@ -8,6 +8,7 @@ import logging
 import math
 import hashlib
 import re
+import unicodedata
 from typing import Dict, List, Any, Tuple
 from collections import defaultdict
 from nlp_engine import SinhalaNLPEngine
@@ -69,6 +70,9 @@ class IntelligentMindMapGenerator:
         # Step 2: Extract key phrases for additional concepts
         key_phrases = self.nlp_engine.extract_key_phrases(text, max_phrases=15)
         logger.info(f"Extracted {len(key_phrases)} key phrases")
+
+        # Step 2b: Merge strong key phrases into entities for richer concepts
+        entities = self._merge_entities_with_phrases(text, entities, key_phrases)
         
         # Step 3: Cluster similar concepts if enabled
         if use_clustering and len(entities) > 3:
@@ -76,15 +80,29 @@ class IntelligentMindMapGenerator:
             logger.info(f"Formed {len(clusters)} concept clusters")
         else:
             clusters = [[e] for e in entities]
+
+        cluster_map = {}
+        for idx, cluster in enumerate(clusters):
+            for entity in cluster:
+                cluster_map[entity['text']] = idx
         
         # Step 4: Extract relationships between entities
         relationships = self.nlp_engine.extract_relationships(text, entities)
         relationships = [r for r in relationships if r['confidence'] >= rel_threshold]
         logger.info(f"Found {len(relationships)} relationships")
+
+        # Step 4b: Extract structured enumerations (phases, examples, requirements)
+        enumerations = self.nlp_engine.extract_enumerations(text)
+        logger.info(f"Found {len(enumerations)} enumerations")
         
         # Step 5: Build hierarchical graph structure
         nodes, edges = self._build_intelligent_graph(
-            text, entities, key_phrases, clusters, relationships, max_nodes
+            text, entities, key_phrases, clusters, relationships, max_nodes, cluster_map
+        )
+
+        # Step 5b: Inject structured enumeration nodes and edges
+        nodes, edges = self._apply_enumeration_structure(
+            nodes, edges, enumerations, max_nodes
         )
         
         # Trim nodes if we exceeded max_nodes
@@ -136,7 +154,8 @@ class IntelligentMindMapGenerator:
         key_phrases: List[Tuple[str, float]],
         clusters: List[List[Dict]],
         relationships: List[Dict],
-        max_nodes: int
+        max_nodes: int,
+        cluster_map: Dict[str, int]
     ) -> Tuple[List[Dict], List[Dict]]:
         """Build the graph structure intelligently."""
         nodes = []
@@ -157,7 +176,9 @@ class IntelligentMindMapGenerator:
             'size': 35,
             'importance': 1.0,
             'color': '#FF6B6B',
-            'offset': root_offset
+            'offset': root_offset,
+            'source_text': root_text,
+            'source_type': 'root'
         })
         node_map[root_text] = root_id
         
@@ -175,7 +196,9 @@ class IntelligentMindMapGenerator:
                 'size': 25,
                 'importance': node_data.get('importance', 0.7),
                 'color': '#4ECDC4',
-                'offset': self._find_offset_in_text(text, node_data['text'])
+                'offset': self._find_offset_in_text(text, node_data['text']),
+                'source_text': node_data['text'],
+                'source_type': node_data.get('source_type', 'entity')
             })
             node_map[node_data['text']] = node_id
             
@@ -203,12 +226,14 @@ class IntelligentMindMapGenerator:
                 'size': 18,
                 'importance': entity['importance'],
                 'color': '#95E1D3',
-                'offset': entity.get('offset', self._find_offset_in_text(text, entity['text']))
+                'offset': entity.get('offset', self._find_offset_in_text(text, entity['text'])),
+                'source_text': entity['text'],
+                'source_type': entity.get('type', 'entity')
             })
             node_map[entity['text']] = node_id
             
             # Connect to most relevant level 1 node
-            parent_id = self._find_best_parent(entity, nodes, level=1)
+            parent_id = self._find_best_parent(entity, nodes, level=1, cluster_map=cluster_map)
             if parent_id:
                 edges.append({
                     'id': self._generate_id(),
@@ -239,12 +264,14 @@ class IntelligentMindMapGenerator:
                 'size': 12,
                 'importance': item['importance'],
                 'color': '#F7DC6F',
-                'offset': self._find_offset_in_text(text, item['text'])
+                'offset': self._find_offset_in_text(text, item['text']),
+                'source_text': item['text'],
+                'source_type': 'phrase'
             })
             node_map[item['text']] = node_id
             
             # Connect to most relevant level 2 node
-            parent_id = self._find_best_parent(item, nodes, level=2)
+            parent_id = self._find_best_parent(item, nodes, level=2, cluster_map=cluster_map)
             if parent_id:
                 edges.append({
                     'id': self._generate_id(),
@@ -275,6 +302,96 @@ class IntelligentMindMapGenerator:
                 })
         
         return nodes, edges
+
+    def _apply_enumeration_structure(
+        self,
+        nodes: List[Dict],
+        edges: List[Dict],
+        enumerations: List[Dict],
+        max_nodes: int
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """Add structured list-based nodes/edges like phases and examples."""
+        if not enumerations:
+            return nodes, edges
+
+        node_lookup = {n['label']: n['id'] for n in nodes}
+        root_id = next((n['id'] for n in nodes if n.get('level') == 0), None)
+
+        def ensure_node(label: str, level: int, node_type: str, size: int, source_type: str) -> str:
+            if label in node_lookup:
+                return node_lookup[label]
+            if len(nodes) >= max_nodes:
+                return None
+            node_id = self._generate_id()
+            nodes.append({
+                'id': node_id,
+                'label': label,
+                'level': level,
+                'type': node_type,
+                'size': size,
+                'importance': 0.6,
+                'color': '#C7C7FF',
+                'offset': self._find_offset_in_text(' '.join([label]), label),
+                'source_text': label,
+                'source_type': source_type
+            })
+            node_lookup[label] = node_id
+            return node_id
+
+        for enum in enumerations:
+            head_label = self.nlp_engine.clean_label(enum.get('head') or '') if enum.get('head') else None
+            items = [self.nlp_engine.clean_label(i) for i in enum.get('items', [])]
+            items = [i for i in items if i]
+            if len(items) < 2:
+                continue
+
+            relation = enum.get('relation')
+            head_id = None
+
+            if head_label:
+                head_id = ensure_node(head_label, 1, 'topic', 22, 'enumeration_head')
+                if head_id and root_id:
+                    edges.append({
+                        'id': self._generate_id(),
+                        'source': root_id,
+                        'target': head_id,
+                        'type': 'includes',
+                        'weight': 2
+                    })
+
+            # If no head, attach to root
+            if not head_id and root_id:
+                head_id = root_id
+
+            previous_id = None
+            for item in items:
+                level = 2 if head_id != root_id else 1
+                item_id = ensure_node(item, level, 'subtopic', 16, 'enumeration_item')
+                if not item_id:
+                    continue
+
+                edge_type = 'example_of' if relation == 'example' else 'phase'
+                if relation == 'requires':
+                    edge_type = 'requires'
+                edges.append({
+                    'id': self._generate_id(),
+                    'source': head_id,
+                    'target': item_id,
+                    'type': edge_type,
+                    'weight': 2
+                })
+
+                if relation == 'sequence' and previous_id:
+                    edges.append({
+                        'id': self._generate_id(),
+                        'source': previous_id,
+                        'target': item_id,
+                        'type': 'followed_by',
+                        'weight': 1
+                    })
+                previous_id = item_id
+
+        return nodes, edges
     
     def _create_main_topics(
         self,
@@ -292,11 +409,12 @@ class IntelligentMindMapGenerator:
                 continue
             
             # Use the most important entity in cluster
-            representative = max(cluster, key=lambda x: x['importance'])
+            representative = self._select_cluster_representative(cluster)
             main_topics.append({
                 'text': representative['text'],
-                'importance': representative['importance'],
-                'cluster_size': len(cluster)
+                'importance': self._score_cluster(cluster),
+                'cluster_size': len(cluster),
+                'source_type': representative.get('type', 'entity')
             })
         
         # If we have too few topics, add from key phrases
@@ -306,7 +424,8 @@ class IntelligentMindMapGenerator:
                     main_topics.append({
                         'text': phrase,
                         'importance': score,
-                        'cluster_size': 1
+                        'cluster_size': 1,
+                        'source_type': 'phrase'
                     })
         
         return sorted(main_topics, key=lambda x: x['importance'], reverse=True)
@@ -318,14 +437,23 @@ class IntelligentMindMapGenerator:
         key_phrases: List[Tuple[str, float]]
     ) -> str:
         """Determine the root topic for the mind map."""
+        # Prefer strong entities near the beginning of the text
+        if entities:
+            text_len = max(1, len(text))
+            early_entities = [
+                e for e in entities
+                if e.get('offset', text_len) <= int(text_len * 0.35)
+            ]
+            if early_entities:
+                early_entities.sort(key=lambda x: (-(x.get('importance', 0)), x.get('offset', 0)))
+                return early_entities[0]['text']
+            entities.sort(key=lambda x: (-(x.get('importance', 0)), x.get('offset', 0)))
+            return entities[0]['text']
+
         # Try to extract from first sentence
         first_sentence = text.split('.')[0].strip()
         if first_sentence and len(first_sentence) < 100:
             return self._truncate_text(first_sentence, 80)
-        
-        # Use highest importance entity
-        if entities:
-            return entities[0]['text']
         
         # Use top key phrase
         if key_phrases:
@@ -338,7 +466,8 @@ class IntelligentMindMapGenerator:
         self,
         item: Dict,
         nodes: List[Dict],
-        level: int
+        level: int,
+        cluster_map: Dict[str, int] = None
     ) -> str:
         """Find the best parent node for an item at a specific level."""
         candidates = [n for n in nodes if n['level'] == level]
@@ -350,22 +479,106 @@ class IntelligentMindMapGenerator:
         best_parent = None
         best_score = -1
         
+        item_text = item['text']
+        item_offset = item.get('offset')
+
         for candidate in candidates:
-            # Use semantic similarity
+            candidate_text = candidate.get('source_text', candidate['label'])
             similarity = self.nlp_engine.compute_semantic_similarity(
-                item['text'], candidate['label']
+                item_text, candidate['label']
             )
-            
-            if similarity > best_score:
-                best_score = similarity
+
+            proximity_score = 0.0
+            candidate_offset = candidate.get('offset')
+            if item_offset is not None and candidate_offset is not None:
+                distance = abs(item_offset - candidate_offset)
+                proximity_score = max(0.0, 1.0 - min(distance, 400) / 400.0)
+
+            cluster_bonus = 0.0
+            if cluster_map:
+                item_cluster = cluster_map.get(item_text)
+                candidate_cluster = cluster_map.get(candidate_text)
+                if item_cluster is not None and item_cluster == candidate_cluster:
+                    cluster_bonus = 1.0
+
+            score = (0.6 * similarity) + (0.25 * proximity_score) + (0.15 * cluster_bonus)
+
+            if score > best_score:
+                best_score = score
                 best_parent = candidate['id']
         
         return best_parent
+
+    def _select_cluster_representative(self, cluster: List[Dict]) -> Dict:
+        """Pick a representative entity that is central and important."""
+        if not cluster:
+            return {'text': '', 'importance': 0.0}
+        if len(cluster) == 1:
+            return cluster[0]
+
+        best_item = None
+        best_score = -1.0
+        for item in cluster:
+            centrality = 0.0
+            for other in cluster:
+                if item is other:
+                    continue
+                centrality += self.nlp_engine.compute_semantic_similarity(
+                    item['text'], other['text']
+                )
+            score = item.get('importance', 0) + (centrality / max(1, len(cluster) - 1))
+            if score > best_score:
+                best_score = score
+                best_item = item
+        return best_item or cluster[0]
+
+    def _score_cluster(self, cluster: List[Dict]) -> float:
+        """Score cluster importance using size and average entity importance."""
+        if not cluster:
+            return 0.0
+        avg_importance = sum(e.get('importance', 0) for e in cluster) / len(cluster)
+        size_boost = min(0.3, math.log(len(cluster) + 1, 3) * 0.2)
+        return min(1.0, avg_importance + size_boost)
+
+    def _merge_entities_with_phrases(
+        self,
+        text: str,
+        entities: List[Dict],
+        key_phrases: List[Tuple[str, float]]
+    ) -> List[Dict]:
+        """Promote high-quality key phrases into entities and dedupe by normalized form."""
+        if not key_phrases:
+            return entities
+
+        normalized_map = {}
+        for entity in entities:
+            key = entity.get('normalized') or self.nlp_engine._normalize_term(entity['text'])
+            normalized_map[key] = entity
+
+        for phrase, score in key_phrases:
+            if score < max(self.min_node_importance, 0.35):
+                continue
+            norm = self.nlp_engine._normalize_term(phrase)
+            if not norm or norm in normalized_map:
+                continue
+
+            normalized_map[norm] = {
+                'text': phrase,
+                'type': 'concept_phrase',
+                'importance': min(1.0, score * 1.1),
+                'context': 'phrase_extraction',
+                'offset': self._find_offset_in_text(text, phrase),
+                'normalized': norm,
+                'frequency': text.count(phrase)
+            }
+
+        return list(normalized_map.values())
     
     def _add_semantic_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
         """Add semantic similarity edges between related nodes at the same level."""
         enhanced_edges = edges.copy()
-        similarity_threshold = 0.7
+        similarity_threshold = 0.75
+        max_edges_per_node = 2
         
         # Group nodes by level (excluding root)
         by_level = defaultdict(list)
@@ -377,41 +590,48 @@ class IntelligentMindMapGenerator:
         for level, level_nodes in by_level.items():
             if len(level_nodes) < 2:
                 continue
-            
+
             for i in range(len(level_nodes)):
-                for j in range(i + 1, len(level_nodes)):
-                    node1 = level_nodes[i]
+                node1 = level_nodes[i]
+                candidates = []
+                for j in range(len(level_nodes)):
+                    if i == j:
+                        continue
                     node2 = level_nodes[j]
-                    
-                    # Check if edge already exists
+
                     existing = any(
                         (e['source'] == node1['id'] and e['target'] == node2['id']) or
                         (e['source'] == node2['id'] and e['target'] == node1['id'])
                         for e in enhanced_edges
                     )
-                    
-                    if not existing:
-                        similarity = self.nlp_engine.compute_semantic_similarity(
-                            node1['label'], node2['label']
-                        )
-                        
-                        if similarity >= similarity_threshold:
-                            enhanced_edges.append({
-                                'id': self._generate_id(),
-                                'source': node1['id'],
-                                'target': node2['id'],
-                                'type': 'semantic',
-                                'weight': 1,
-                                'similarity': similarity,
-                                'style': 'dashed'
-                            })
+                    if existing:
+                        continue
+
+                    similarity = self.nlp_engine.compute_semantic_similarity(
+                        node1['label'], node2['label']
+                    )
+                    if similarity >= similarity_threshold:
+                        candidates.append((similarity, node2))
+
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                for similarity, node2 in candidates[:max_edges_per_node]:
+                    enhanced_edges.append({
+                        'id': self._generate_id(),
+                        'source': node1['id'],
+                        'target': node2['id'],
+                        'type': 'semantic',
+                        'weight': 1,
+                        'similarity': similarity,
+                        'style': 'dashed'
+                    })
         
         return enhanced_edges
 
     def _add_cross_level_semantic_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
         """Connect semantically close nodes across adjacent levels for richer structure."""
         enhanced = edges.copy()
-        similarity_threshold = 0.8
+        similarity_threshold = 0.82
+        max_edges_per_parent = 2
         # Index nodes by level for quick lookup
         by_level = defaultdict(list)
         for node in nodes:
@@ -424,6 +644,7 @@ class IntelligentMindMapGenerator:
                 continue
 
             for parent in lower:
+                candidates = []
                 for child in upper:
                     # Skip if already connected
                     exists = any(
@@ -436,15 +657,19 @@ class IntelligentMindMapGenerator:
 
                     similarity = self.nlp_engine.compute_semantic_similarity(parent['label'], child['label'])
                     if similarity >= similarity_threshold:
-                        enhanced.append({
-                            'id': self._generate_id(),
-                            'source': parent['id'],
-                            'target': child['id'],
-                            'type': 'semantic_cross',
-                            'weight': 1,
-                            'similarity': similarity,
-                            'style': 'dotted'
-                        })
+                        candidates.append((similarity, child))
+
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                for similarity, child in candidates[:max_edges_per_parent]:
+                    enhanced.append({
+                        'id': self._generate_id(),
+                        'source': parent['id'],
+                        'target': child['id'],
+                        'type': 'semantic_cross',
+                        'weight': 1,
+                        'similarity': similarity,
+                        'style': 'dotted'
+                    })
         return enhanced
 
     def _add_proximity_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
@@ -555,6 +780,10 @@ class IntelligentMindMapGenerator:
 
     def _normalize_text(self, text: str) -> str:
         """Normalize control characters while preserving Sinhala-friendly spacing."""
+        try:
+            text = unicodedata.normalize('NFC', text)
+        except Exception:
+            pass
         cleaned = re.sub(r'[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f-\x9f]', ' ', text)
         cleaned = re.sub(r'[ \t\r\f\v]+', ' ', cleaned)
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)

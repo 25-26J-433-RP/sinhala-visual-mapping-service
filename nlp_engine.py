@@ -5,6 +5,8 @@ Uses lightweight models for intelligent node and relationship extraction.
 
 import re
 import hashlib
+import math
+import unicodedata
 from typing import List, Dict, Tuple, Set, Any
 import numpy as np
 from collections import defaultdict, Counter
@@ -21,6 +23,7 @@ class SinhalaNLPEngine:
         """Initialize the NLP engine with lightweight models."""
         self.embeddings_model = None
         self.sinling_available = False
+        self.sinling_tokenizer = None
         self.embeddings_model_name = getattr(
             Config, 'EMBEDDINGS_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2'
         )
@@ -39,6 +42,11 @@ class SinhalaNLPEngine:
             import sinling
             self.sinling_available = True
             logger.info("Sinling library available for Sinhala processing")
+            try:
+                from sinling import SinhalaTokenizer
+                self.sinling_tokenizer = SinhalaTokenizer()
+            except Exception as e:
+                logger.warning("Could not initialize SinhalaTokenizer: %s", e)
         except ImportError:
             logger.warning("Sinling not available, using fallback methods")
         
@@ -52,6 +60,18 @@ class SinhalaNLPEngine:
         self.weak_words = ['වුණු', 'වුණා', 'ඇතුළු', 'වන', 'වේ', 'වැයි', 'වෙයි', 'ඉතිරිය', 'ගුණඉංගිතවතුන්', 'ජීවිතයේ', 'කෝශවල', 'ප්‍රධාන', 'කොටස්ය']
         
         self.question_words = ['කවර', 'කොහොමද', 'කුමක්', 'ඇයි', 'මොකද', 'කවදා', 'කොතැනද']
+
+        # Relationship markers for heuristic edge typing
+        self.definition_markers = ['යනු', 'හෙවත්', 'කියන', 'අර්ථය', 'අර්ථයෙන්', 'හැඳින්වෙයි']
+        self.cause_markers = ['නිසා', 'හේතුවෙන්', 'ප්‍රතිඵලයෙන්', 'ප්‍රතිඵලයක් ලෙස', 'ඒ හේතුවෙන්']
+        self.part_markers = ['අංශය', 'කොටස', 'අයත්', 'අංග', 'අභ්‍යන්තර', 'භාගය']
+        self.example_markers = ['උදාහරණ', 'උදාහරණයක්', 'උදා:', 'දෙසට']
+
+        # Tokenization helpers
+        self.word_pattern = re.compile(r'[A-Za-z0-9\u0D80-\u0DFF]+')
+        self.list_split_pattern = re.compile(r'\s*,\s*|\s+සහ\s+|\s+හා\s+|\s+මෙන්ම\s+')
+        self.sequence_markers = ['අදියර', 'පියවර', 'අවස්ථා']
+        self.importance_markers = ['වැදගත්', 'අත්‍යවශ්‍ය', 'අතිශය වැදගත්']
         
         # Comprehensive Sinhala stop words (helping words that should not appear in nodes)
         self.stop_words = set([
@@ -85,9 +105,15 @@ class SinhalaNLPEngine:
             List of entity dictionaries with type, text, and importance score
         """
         entities = []
+        text = self._normalize_unicode(text)
         
         # Split text into sentences with character offsets for positional tracking
         sentences = self._split_sentences_with_spans(text)
+
+        # Precompute token frequencies and sentence-level document frequencies
+        tokens = [self._normalize_term(t) for t in self._tokenize(text)]
+        freq_map = Counter([t for t in tokens if t])
+        df_map, total_sentences = self._sentence_document_frequency(sentences)
         used_spans: List[Tuple[int, int]] = []
         
         for sentence, sent_start in sentences:
@@ -99,6 +125,22 @@ class SinhalaNLPEngine:
                 if len(word) >= 3:
                     # Calculate importance based on position and context
                     importance = self._calculate_word_importance(word, sentence, i, len(words))
+
+                    # Boost importance by frequency in full text
+                    norm = self._normalize_term(word)
+                    if norm:
+                        count = freq_map.get(norm, 1)
+                        if count > 1:
+                            importance += min(0.25, 0.07 * (count - 1))
+
+                        # Apply sentence-level IDF boost to favor distinctive concepts
+                        df = df_map.get(norm, 0)
+                        if total_sentences > 0:
+                            idf = math.log((1 + total_sentences) / (1 + df)) + 1
+                            idf_scale = min(1.4, 0.8 + (idf * 0.15))
+                            importance *= idf_scale
+
+                    importance = min(1.0, max(0.0, importance))
                     
                     if importance > 0.3:
                         # Track a stable character offset for this occurrence
@@ -109,8 +151,46 @@ class SinhalaNLPEngine:
                             'type': self._classify_entity_type(word, sentence),
                             'importance': importance,
                             'context': sentence,
-                            'offset': offset
+                            'offset': offset,
+                            'normalized': norm,
+                            'frequency': freq_map.get(norm, 1)
                         })
+
+            # Extract short multi-word concept phrases per sentence
+            phrase_budget = 0
+            sentence_words = [w for w in words if w and len(w) > 2]
+            for i in range(len(sentence_words)):
+                if sentence_words[i] in self.stop_words:
+                    continue
+                for j in range(i + 2, min(i + 4, len(sentence_words) + 1)):
+                    phrase = ' '.join(sentence_words[i:j])
+                    if self._is_stop_phrase(phrase):
+                        continue
+                    score = self._calculate_phrase_importance(phrase, text)
+                    if score <= 0.35:
+                        continue
+                    offset = self._find_offset(sentence, phrase, sent_start, used_spans)
+                    used_spans.append((offset, offset + len(phrase)))
+                    normalized_phrase = self._normalize_term(phrase)
+                    if normalized_phrase:
+                        df = df_map.get(normalized_phrase, 0)
+                        if total_sentences > 0:
+                            idf = math.log((1 + total_sentences) / (1 + df)) + 1
+                            score = min(1.0, score * min(1.4, 0.9 + (idf * 0.12)))
+                    entities.append({
+                        'text': phrase,
+                        'type': 'concept_phrase',
+                        'importance': min(1.0, score),
+                        'context': sentence,
+                        'offset': offset,
+                        'normalized': normalized_phrase,
+                        'frequency': text.count(phrase)
+                    })
+                    phrase_budget += 1
+                    if phrase_budget >= 5:
+                        break
+                if phrase_budget >= 5:
+                    break
         
         # Deduplicate and sort by importance
         entities = self._deduplicate_entities(entities)
@@ -175,6 +255,8 @@ class SinhalaNLPEngine:
                 other = ordered_entities[j]
                 if entity['text'] == other['text']:
                     continue
+                if self.compute_semantic_similarity(entity['text'], other['text']) < 0.15:
+                    continue
                 # Distance-based confidence (closer concepts get higher weight)
                 distance = abs(entity.get('offset', 0) - other.get('offset', 0))
                 if distance > 400:  # limit to nearby co-occurrences
@@ -205,8 +287,11 @@ class SinhalaNLPEngine:
             Similarity score between 0 and 1
         """
         if not self.embeddings_model:
-            # Fallback to simple word overlap
-            return self._word_overlap_similarity(text1, text2)
+            # Fallback to lexical and character n-gram similarity
+            return max(
+                self._word_overlap_similarity(text1, text2),
+                self._char_ngram_similarity(text1, text2)
+            )
         
         try:
             embeddings = self.embeddings_model.encode([text1, text2])
@@ -216,7 +301,10 @@ class SinhalaNLPEngine:
             return float(similarity)
         except Exception as e:
             logger.warning(f"Error computing similarity: {e}")
-            return self._word_overlap_similarity(text1, text2)
+            return max(
+                self._word_overlap_similarity(text1, text2),
+                self._char_ngram_similarity(text1, text2)
+            )
     
     def cluster_concepts(self, entities: List[Dict], threshold: float = 0.6) -> List[List[Dict]]:
         """
@@ -236,6 +324,8 @@ class SinhalaNLPEngine:
             # Extract texts for embedding
             texts = [e['text'] for e in entities]
             embeddings = self.embeddings_model.encode(texts)
+
+            threshold = self._adaptive_cluster_threshold(embeddings, threshold)
             
             # Simple agglomerative clustering
             clusters = []
@@ -323,6 +413,53 @@ class SinhalaNLPEngine:
                 filtered_phrases.append((phrase, score))
         
         return filtered_phrases[:max_phrases]
+
+    def extract_enumerations(self, text: str) -> List[Dict[str, Any]]:
+        """Extract enumerations like phases, examples, and required items."""
+        enumerations: List[Dict[str, Any]] = []
+        sentences = self._split_sentences_with_spans(text)
+
+        for sentence, _ in sentences:
+            if not sentence or len(sentence) < 10:
+                continue
+
+            # Phase/sequence enumeration
+            if any(marker in sentence for marker in self.sequence_markers):
+                list_text = self._extract_list_after_marker(sentence, 'ලෙස') or self._extract_list_after_marker(sentence, 'වශයෙන්')
+                if not list_text:
+                    list_text = sentence
+                items = self._extract_list_items(list_text)
+                if len(items) >= 2:
+                    head = self._infer_head_phrase(sentence, self.sequence_markers)
+                    enumerations.append({
+                        'head': head or 'අදියර',
+                        'items': items,
+                        'relation': 'sequence'
+                    })
+
+            # Example enumeration with "වැනි" or explicit examples
+            if 'වැනි' in sentence or any(marker in sentence for marker in self.example_markers):
+                before, after = sentence.split('වැනි', 1) if 'වැනි' in sentence else (sentence, '')
+                items = self._extract_list_items(before)
+                head = self._first_token(after) or self._infer_head_phrase(sentence, ['භාෂා', 'ක්‍රමවේද', 'මූලධර්ම'])
+                if len(items) >= 2:
+                    enumerations.append({
+                        'head': head,
+                        'items': items,
+                        'relation': 'example'
+                    })
+
+            # Importance/requirements enumeration
+            if any(marker in sentence for marker in self.importance_markers):
+                items = self._extract_list_items(sentence)
+                if len(items) >= 2:
+                    enumerations.append({
+                        'head': None,
+                        'items': items,
+                        'relation': 'requires'
+                    })
+
+        return enumerations
     
     def _split_sentences(self, text: str) -> List[str]:
         """Split text into sentences (legacy helper)."""
@@ -435,8 +572,20 @@ class SinhalaNLPEngine:
             proximity_score = max(0.0, 1.0 - min(distance, 200) / 200.0)  # clamp at 200 chars
             confidence += 0.2 * proximity_score
         
-        # Check for specific relationship indicators
-        if any(post in between for post in self.postpositions):
+        # Check for specific relationship indicators (ordered by specificity)
+        if any(marker in between for marker in self.definition_markers):
+            rel_type = 'definition'
+            confidence += 0.35
+        elif any(marker in between for marker in self.cause_markers):
+            rel_type = 'cause'
+            confidence += 0.3
+        elif any(marker in between for marker in self.part_markers):
+            rel_type = 'part_of'
+            confidence += 0.25
+        elif any(marker in between for marker in self.example_markers):
+            rel_type = 'example'
+            confidence += 0.2
+        elif any(post in between for post in self.postpositions):
             rel_type = 'semantic'
             confidence += 0.2
         elif any(conn in between for conn in self.connectors):
@@ -460,6 +609,9 @@ class SinhalaNLPEngine:
         
         for entity in entities:
             text = entity['text']
+            key = entity.get('normalized') or self._normalize_term(text)
+            if not key:
+                key = text
             
             # Skip if it's a verb form or weak word
             if text in self.action_verbs or text in self.weak_words:
@@ -473,8 +625,13 @@ class SinhalaNLPEngine:
                         entity_dict[text] = entity
                 continue
             
-            if text not in entity_dict or entity_dict[text]['importance'] < entity['importance']:
-                entity_dict[text] = entity
+            if key not in entity_dict or entity_dict[key]['importance'] < entity['importance']:
+                entity_dict[key] = entity
+                entity_dict[key]['aliases'] = list({text} | set(entity.get('aliases', [])))
+            else:
+                aliases = set(entity_dict[key].get('aliases', []))
+                aliases.add(text)
+                entity_dict[key]['aliases'] = list(aliases)
         
         return list(entity_dict.values())
     
@@ -490,12 +647,29 @@ class SinhalaNLPEngine:
         union = len(words1 | words2)
         
         return intersection / union if union > 0 else 0.0
+
+    def _char_ngram_similarity(self, text1: str, text2: str, n: int = 3) -> float:
+        """Character n-gram similarity for short Sinhala terms."""
+        t1 = self._normalize_term(text1)
+        t2 = self._normalize_term(text2)
+
+        if not t1 or not t2:
+            return 0.0
+
+        grams1 = {t1[i:i + n] for i in range(max(1, len(t1) - n + 1))}
+        grams2 = {t2[i:i + n] for i in range(max(1, len(t2) - n + 1))}
+        if not grams1 or not grams2:
+            return 0.0
+
+        intersection = len(grams1 & grams2)
+        union = len(grams1 | grams2)
+        return intersection / union if union else 0.0
     
     def clean_label(self, text: str) -> str:
         """Remove stop words from text to show only concepts."""
         if not text or not text.strip():
             return text
-            
+        text = self._normalize_unicode(text)
         words = text.split()
         # Filter out stop words and very short words
         cleaned_words = [
@@ -513,6 +687,107 @@ class SinhalaNLPEngine:
             cleaned_words = words_by_length[:min(3, len(words_by_length))]
         
         return ' '.join(cleaned_words)
+
+    def _tokenize(self, text: str) -> List[str]:
+        """Tokenize text with Sinhala-aware pattern."""
+        if not text:
+            return []
+        if self.sinling_tokenizer:
+            try:
+                tokens = self.sinling_tokenizer.tokenize(text)
+                return [t for t in tokens if t and t.strip()]
+            except Exception:
+                pass
+        return self.word_pattern.findall(text)
+
+    def _adaptive_cluster_threshold(self, embeddings: np.ndarray, base_threshold: float) -> float:
+        """Adjust clustering threshold based on similarity distribution."""
+        if embeddings is None or len(embeddings) < 3:
+            return base_threshold
+
+        sample_pairs = []
+        max_pairs = 120
+        total = len(embeddings)
+        for i in range(total):
+            for j in range(i + 1, min(total, i + 10)):
+                sim = np.dot(embeddings[i], embeddings[j]) / (
+                    np.linalg.norm(embeddings[i]) * np.linalg.norm(embeddings[j])
+                )
+                sample_pairs.append(sim)
+                if len(sample_pairs) >= max_pairs:
+                    break
+            if len(sample_pairs) >= max_pairs:
+                break
+
+        if not sample_pairs:
+            return base_threshold
+
+        median_sim = float(np.median(sample_pairs))
+        return max(base_threshold, min(0.85, median_sim + 0.08))
+
+    def _extract_list_after_marker(self, sentence: str, marker: str) -> str:
+        """Extract list-like substring after a marker like 'ලෙස' or 'වශයෙන්'."""
+        if marker in sentence:
+            parts = sentence.split(marker, 1)
+            if len(parts) == 2:
+                return parts[1]
+        return ''
+
+    def _extract_list_items(self, text: str) -> List[str]:
+        """Extract list items from a sentence-like fragment."""
+        if not text:
+            return []
+        cleaned = re.sub(r'[()\[\]{}"\'\u201c\u201d]', ' ', text)
+        candidates = [c.strip() for c in self.list_split_pattern.split(cleaned) if c.strip()]
+        items = []
+        for cand in candidates:
+            label = self.clean_label(cand)
+            if label and len(label) >= 2 and label not in items:
+                items.append(label)
+        return items
+
+    def _infer_head_phrase(self, sentence: str, keywords: List[str]) -> str:
+        """Infer a head concept phrase around a keyword."""
+        for keyword in keywords:
+            if keyword in sentence:
+                idx = sentence.find(keyword)
+                left = sentence[max(0, idx - 30):idx].strip()
+                tokens = [t for t in self._tokenize(left) if t not in self.stop_words]
+                if tokens:
+                    return ' '.join(tokens[-2:] + [keyword]) if keyword not in tokens else ' '.join(tokens[-2:])
+                return keyword
+        return ''
+
+    def _first_token(self, text: str) -> str:
+        """Return the first token in text."""
+        tokens = self._tokenize(text)
+        return tokens[0] if tokens else ''
+
+    def _sentence_document_frequency(self, sentences: List[Tuple[str, int]]) -> Tuple[Dict[str, int], int]:
+        """Calculate sentence-level document frequency for normalized tokens."""
+        df_map = Counter()
+        for sentence, _ in sentences:
+            tokens = {self._normalize_term(t) for t in self._tokenize(sentence)}
+            tokens = {t for t in tokens if t}
+            for token in tokens:
+                df_map[token] += 1
+        return dict(df_map), len(sentences)
+
+    def _normalize_term(self, text: str) -> str:
+        """Normalize term for comparison and deduping."""
+        if not text:
+            return ''
+        text = self._normalize_unicode(text)
+        cleaned = re.sub(r'[^A-Za-z0-9\u0D80-\u0DFF ]+', '', text)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        return cleaned
+
+    def _normalize_unicode(self, text: str) -> str:
+        """Normalize Unicode to NFC to preserve Sinhala combining marks."""
+        try:
+            return unicodedata.normalize('NFC', text)
+        except Exception:
+            return text
     
     def _simple_cluster(self, entities: List[Dict]) -> List[List[Dict]]:
         """Simple clustering based on text patterns."""
@@ -531,8 +806,9 @@ class SinhalaNLPEngine:
                     continue
                 
                 # Check for similarity
-                similarity = self._word_overlap_similarity(
-                    entity['text'], entities[j]['text']
+                similarity = max(
+                    self._word_overlap_similarity(entity['text'], entities[j]['text']),
+                    self._char_ngram_similarity(entity['text'], entities[j]['text'])
                 )
                 
                 if similarity > 0.3:
