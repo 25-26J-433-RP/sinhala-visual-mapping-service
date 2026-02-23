@@ -98,6 +98,8 @@ class SinhalaNLPEngine:
         ])
         
     def extract_entities(self, text: str) -> List[Dict[str, Any]]:
+        from sinhala_normalization import normalize_sinhala_text
+        text = normalize_sinhala_text(text)
         """
         Extract named entities and important concepts from text.
         
@@ -197,6 +199,8 @@ class SinhalaNLPEngine:
         return sorted(entities, key=lambda x: x['importance'], reverse=True)
     
     def extract_relationships(self, text: str, entities: List[Dict]) -> List[Dict[str, Any]]:
+        from sinhala_normalization import normalize_sinhala_text
+        text = normalize_sinhala_text(text)
         """
         Extract relationships between entities.
         
@@ -362,6 +366,8 @@ class SinhalaNLPEngine:
             return [[e] for e in entities]
     
     def extract_key_phrases(self, text: str, max_phrases: int = 10) -> List[Tuple[str, float]]:
+        from sinhala_normalization import normalize_sinhala_text
+        text = normalize_sinhala_text(text)
         """Extract key phrases with importance scores.
 
         Prioritizes compound nouns and concept phrases for Sinhala text.
