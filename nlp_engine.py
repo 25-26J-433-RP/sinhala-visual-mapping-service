@@ -17,6 +17,34 @@ logger = logging.getLogger(__name__)
 
 
 class SinhalaNLPEngine:
+        # Sinhala-aware tokenization
+        def _tokenize(self, text: str) -> List[str]:
+            """Sinhala-aware tokenization: use sinling if available, else fallback to improved regex."""
+            if not text:
+                return []
+            if self.sinling_tokenizer:
+                try:
+                    tokens = self.sinling_tokenizer.tokenize(text)
+                    return [t for t in tokens if t and t.strip()]
+                except Exception:
+                    pass
+            # Improved fallback: split on Sinhala/Latin boundaries and punctuation
+            text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)  # Remove zero-width
+            tokens = re.findall(r'[\u0D80-\u0DFFa-zA-Z0-9]+', text)
+            return tokens
+        # Sinhala-aware sentence splitting
+        def _split_sentences(self, text: str) -> List[str]:
+            """Sinhala-aware sentence splitting: use sinling if available, else improved regex."""
+            if not text:
+                return []
+            try:
+                from sinling.sentence_splitter import split_sentences
+                return [s.strip() for s in split_sentences(text) if s.strip() and len(s.strip()) > 5]
+            except Exception:
+                pass
+            # Fallback: split on Sinhala danda, period, exclamation, question, and newlines
+            sentences = re.split(r'[\.\!\?\u0DF4\n]+', text)
+            return [s.strip() for s in sentences if s.strip() and len(s.strip()) > 5]
     """Lightweight NLP engine for Sinhala text processing."""
     
     def __init__(self):
@@ -368,52 +396,46 @@ class SinhalaNLPEngine:
     def extract_key_phrases(self, text: str, max_phrases: int = 10) -> List[Tuple[str, float]]:
         from sinhala_normalization import normalize_sinhala_text
         text = normalize_sinhala_text(text)
-        """Extract key phrases with importance scores.
-
-        Prioritizes compound nouns and concept phrases for Sinhala text.
-        """
+        """Sinhala-aware phrase chunking: extract noun phrases and named entities."""
         if not text:
             return []
-
         sentences = self._split_sentences(text)
         phrases = []
-        
         for sentence in sentences:
-            # Extract noun phrases (simplified for Sinhala)
-            words = sentence.split()
-            
-            # Look for meaningful multi-word phrases
+            # Use sinling noun phrase chunker if available
+            try:
+                from sinling import SinhalaPhraseChunker
+                chunker = SinhalaPhraseChunker()
+                chunks = chunker.chunk(sentence)
+                for chunk in chunks:
+                    if chunk['type'] == 'NP':
+                        phrase = chunk['text']
+                        if len(phrase) >= 8 and len(phrase) <= 80 and not self._is_stop_phrase(phrase):
+                            score = self._calculate_phrase_importance(phrase, text)
+                            if score > 0.3:
+                                phrases.append((phrase, score))
+                continue
+            except Exception:
+                pass
+            # Fallback: use sliding window for multi-word noun-like phrases
+            words = self._tokenize(sentence)
             for i in range(len(words)):
-                # Check word at position i - skip if it's a stop word
                 if words[i] in self.stop_words or len(words[i]) <= 2:
                     continue
-                
-                # Prefer 2-3 word phrases for compound nouns
                 for j in range(i + 2, min(i + 4, len(words) + 1)):
                     phrase = ' '.join(words[i:j])
-                    
-                    # Filter out phrases that are mostly stop words
                     if len(phrase) >= 8 and len(phrase) <= 80 and not self._is_stop_phrase(phrase):
                         score = self._calculate_phrase_importance(phrase, text)
-                        
-                        # Boost score for 2-word compound nouns (often concepts)
-                        if j - i == 2:  # 2-word phrase
-                            score *= 1.2
-                        
                         if score > 0.3:
                             phrases.append((phrase, score))
-        
         # Deduplicate and sort
         phrase_dict = {}
         for phrase, score in phrases:
             if phrase not in phrase_dict or phrase_dict[phrase] < score:
                 phrase_dict[phrase] = score
-        
-        # Remove sub-phrases if better phrase exists
         phrase_list = sorted(phrase_dict.items(), key=lambda x: x[1], reverse=True)
         filtered_phrases = []
         for phrase, score in phrase_list:
-            # Check if this phrase is already covered by a longer phrase
             is_subphrase = False
             for existing, _ in filtered_phrases:
                 if phrase in existing and len(existing) > len(phrase):
@@ -421,7 +443,6 @@ class SinhalaNLPEngine:
                     break
             if not is_subphrase:
                 filtered_phrases.append((phrase, score))
-        
         return filtered_phrases[:max_phrases]
 
     def extract_enumerations(self, text: str) -> List[Dict[str, Any]]:
