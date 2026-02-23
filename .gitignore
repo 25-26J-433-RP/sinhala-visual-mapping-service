@@ -46,3 +46,6 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Model outputs
+concept-extractor-model/
