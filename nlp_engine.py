@@ -12,41 +12,14 @@ import numpy as np
 from collections import defaultdict, Counter
 import logging
 from config import Config
+from hybrid_node_extractor import HybridNodeExtractor
 
 logger = logging.getLogger(__name__)
 
 
 class SinhalaNLPEngine:
-        # Sinhala-aware tokenization
-        def _tokenize(self, text: str) -> List[str]:
-            """Sinhala-aware tokenization: use sinling if available, else fallback to improved regex."""
-            if not text:
-                return []
-            if self.sinling_tokenizer:
-                try:
-                    tokens = self.sinling_tokenizer.tokenize(text)
-                    return [t for t in tokens if t and t.strip()]
-                except Exception:
-                    pass
-            # Improved fallback: split on Sinhala/Latin boundaries and punctuation
-            text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)  # Remove zero-width
-            tokens = re.findall(r'[\u0D80-\u0DFFa-zA-Z0-9]+', text)
-            return tokens
-        # Sinhala-aware sentence splitting
-        def _split_sentences(self, text: str) -> List[str]:
-            """Sinhala-aware sentence splitting: use sinling if available, else improved regex."""
-            if not text:
-                return []
-            try:
-                from sinling.sentence_splitter import split_sentences
-                return [s.strip() for s in split_sentences(text) if s.strip() and len(s.strip()) > 5]
-            except Exception:
-                pass
-            # Fallback: split on Sinhala danda, period, exclamation, question, and newlines
-            sentences = re.split(r'[\.\!\?\u0DF4\n]+', text)
-            return [s.strip() for s in sentences if s.strip() and len(s.strip()) > 5]
     """Lightweight NLP engine for Sinhala text processing."""
-    
+
     def __init__(self):
         """Initialize the NLP engine with lightweight models."""
         self.embeddings_model = None
@@ -124,107 +97,84 @@ class SinhalaNLPEngine:
             # Short common words
             'ට', 'ටත්', 'යන', 'දී', 'ගේ', 'වල', 'ය', 'යි'
         ])
-        
-    def extract_entities(self, text: str) -> List[Dict[str, Any]]:
+
+        # Hybrid node extractor (rule patterns + embeddings + re-ranker)
+        self.hybrid_extractor = HybridNodeExtractor(self)
+
+        # ── Per-relation-type confidence thresholds ───────────────────────────
+        # Rationale:
+        #   is-a        – requires an explicit definition / example marker; set high
+        #                 so only linguistically-grounded definitional edges survive.
+        #   part-of     – part/component markers are fairly reliable but can appear
+        #                 in loose contexts; moderate threshold.
+        #   cause-effect– causal claims need strong lexical evidence; set high.
+        #   related-to  – catch-all (proximity, conjunction, semantic co-occurrence);
+        #                 set low to preserve weak but plausible links.
+        self.rel_thresholds: Dict[str, float] = {
+            'is-a':         0.58,
+            'part-of':      0.52,
+            'cause-effect': 0.55,
+            'related-to':   0.42,
+        }
+
+        # Map internal relation labels → canonical four-way taxonomy
+        self.rel_type_canonical: Dict[str, str] = {
+            'definition':  'is-a',
+            'example':     'is-a',
+            'part_of':     'part-of',
+            'cause':       'cause-effect',
+            'action':      'cause-effect',
+            'semantic':    'related-to',
+            'conjunction': 'related-to',
+            'close':       'related-to',
+            'related':     'related-to',
+            'proximity':   'related-to',
+        }
+
+    # ------------------------------------------------------------------
+    # Public extraction methods
+    # ------------------------------------------------------------------
+
+    def extract_nodes_hybrid(self, text: str, max_nodes: int = 40) -> List[Dict[str, Any]]:
+        """
+        Hybrid concept node extraction combining:
+          1. Rule-based POS / chunk patterns (high recall)
+          2. Embedding similarity to concept anchors (high precision)
+          3. Confidence re-ranker (balanced ranking)
+
+        Returns
+        -------
+        List[Dict]
+            Sorted by ``confidence`` descending. Each dict contains:
+            ``text``, ``type``, ``importance``, ``confidence``,
+            ``rule_score``, ``embed_score``, ``frequency``,
+            ``context``, ``offset``, ``normalized``
+        """
         from sinhala_normalization import normalize_sinhala_text
-        text = normalize_sinhala_text(text)
+        text = normalize_sinhala_text(self._normalize_unicode(text))
+        return self.hybrid_extractor.extract(text, max_nodes=max_nodes)
+
+    def extract_entities(self, text: str) -> List[Dict[str, Any]]:
         """
         Extract named entities and important concepts from text.
-        
-        Returns:
-            List of entity dictionaries with type, text, and importance score
+
+        Delegates to the HybridNodeExtractor pipeline (rule patterns +
+        embedding similarity + confidence re-ranker) for improved recall
+        and precision over the previous single-signal heuristic approach.
+
+        Returns
+        -------
+        List[Dict]
+            Entity dicts sorted by ``importance`` (= ``confidence``) descending.
         """
-        entities = []
-        text = self._normalize_unicode(text)
-        
-        # Split text into sentences with character offsets for positional tracking
-        sentences = self._split_sentences_with_spans(text)
-
-        # Precompute token frequencies and sentence-level document frequencies
-        tokens = [self._normalize_term(t) for t in self._tokenize(text)]
-        freq_map = Counter([t for t in tokens if t])
-        df_map, total_sentences = self._sentence_document_frequency(sentences)
-        used_spans: List[Tuple[int, int]] = []
-        
-        for sentence, sent_start in sentences:
-            # Extract proper nouns (capitalized words in Sinhala context)
-            words = sentence.split()
-            
-            for i, word in enumerate(words):
-                # Check if word is a potential entity
-                if len(word) >= 3:
-                    # Calculate importance based on position and context
-                    importance = self._calculate_word_importance(word, sentence, i, len(words))
-
-                    # Boost importance by frequency in full text
-                    norm = self._normalize_term(word)
-                    if norm:
-                        count = freq_map.get(norm, 1)
-                        if count > 1:
-                            importance += min(0.25, 0.07 * (count - 1))
-
-                        # Apply sentence-level IDF boost to favor distinctive concepts
-                        df = df_map.get(norm, 0)
-                        if total_sentences > 0:
-                            idf = math.log((1 + total_sentences) / (1 + df)) + 1
-                            idf_scale = min(1.4, 0.8 + (idf * 0.15))
-                            importance *= idf_scale
-
-                    importance = min(1.0, max(0.0, importance))
-                    
-                    if importance > 0.3:
-                        # Track a stable character offset for this occurrence
-                        offset = self._find_offset(sentence, word, sent_start, used_spans)
-                        used_spans.append((offset, offset + len(word)))
-                        entities.append({
-                            'text': word,
-                            'type': self._classify_entity_type(word, sentence),
-                            'importance': importance,
-                            'context': sentence,
-                            'offset': offset,
-                            'normalized': norm,
-                            'frequency': freq_map.get(norm, 1)
-                        })
-
-            # Extract short multi-word concept phrases per sentence
-            phrase_budget = 0
-            sentence_words = [w for w in words if w and len(w) > 2]
-            for i in range(len(sentence_words)):
-                if sentence_words[i] in self.stop_words:
-                    continue
-                for j in range(i + 2, min(i + 4, len(sentence_words) + 1)):
-                    phrase = ' '.join(sentence_words[i:j])
-                    if self._is_stop_phrase(phrase):
-                        continue
-                    score = self._calculate_phrase_importance(phrase, text)
-                    if score <= 0.35:
-                        continue
-                    offset = self._find_offset(sentence, phrase, sent_start, used_spans)
-                    used_spans.append((offset, offset + len(phrase)))
-                    normalized_phrase = self._normalize_term(phrase)
-                    if normalized_phrase:
-                        df = df_map.get(normalized_phrase, 0)
-                        if total_sentences > 0:
-                            idf = math.log((1 + total_sentences) / (1 + df)) + 1
-                            score = min(1.0, score * min(1.4, 0.9 + (idf * 0.12)))
-                    entities.append({
-                        'text': phrase,
-                        'type': 'concept_phrase',
-                        'importance': min(1.0, score),
-                        'context': sentence,
-                        'offset': offset,
-                        'normalized': normalized_phrase,
-                        'frequency': text.count(phrase)
-                    })
-                    phrase_budget += 1
-                    if phrase_budget >= 5:
-                        break
-                if phrase_budget >= 5:
-                    break
-        
-        # Deduplicate and sort by importance
-        entities = self._deduplicate_entities(entities)
-        return sorted(entities, key=lambda x: x['importance'], reverse=True)
+        from sinhala_normalization import normalize_sinhala_text
+        text = normalize_sinhala_text(self._normalize_unicode(text))
+        entities = self.hybrid_extractor.extract(text)
+        # Classify entity type for any node that still has the default type
+        for e in entities:
+            if e.get('type') in ('concept', None):
+                e['type'] = self._classify_entity_type(e['text'], e.get('context', ''))
+        return entities
     
     def extract_relationships(self, text: str, entities: List[Dict]) -> List[Dict[str, Any]]:
         from sinhala_normalization import normalize_sinhala_text
@@ -256,12 +206,14 @@ class SinhalaNLPEngine:
                         entity2 = sentence_entities[j]
                         
                         # Determine relationship type and strength
-                        rel_type, confidence = self._analyze_relationship(
+                        raw_type, confidence = self._analyze_relationship(
                             entity1['text'], entity2['text'], sentence,
                             entity1.get('offset'), entity2.get('offset')
                         )
-                        
-                        if confidence > 0.4:
+                        rel_type = self.rel_type_canonical.get(raw_type, 'related-to')
+                        threshold = self.rel_thresholds.get(rel_type, 0.45)
+
+                        if confidence > threshold:
                             key = tuple(sorted([entity1['text'], entity2['text']]) + [rel_type])
                             # Keep the strongest confidence for duplicate pairs
                             existing = next((r for r in relationships if r.get('key') == key), None)
@@ -289,23 +241,27 @@ class SinhalaNLPEngine:
                 other = ordered_entities[j]
                 if entity['text'] == other['text']:
                     continue
-                # INCREASED threshold from 0.15 to 0.4 to be more selective
-                if self.compute_semantic_similarity(entity['text'], other['text']) < 0.4:
+                # Minimum semantic similarity gate for proximity edges
+                _prox_sim_gate = self.rel_thresholds.get('related-to', 0.42)
+                if self.compute_semantic_similarity(entity['text'], other['text']) < _prox_sim_gate:
                     continue
                 # Distance-based confidence (closer concepts get higher weight)
                 distance = abs(entity.get('offset', 0) - other.get('offset', 0))
-                # REDUCED: limit to very nearby co-occurrences (100 instead of 400)
+                # Limit to very nearby co-occurrences
                 if distance > 100:
                     break
                 confidence = max(0.5, 0.95 - (distance / 200.0))
-                key = tuple(sorted([entity['text'], other['text']]) + ['proximity'])
+                # Proximity edges are classified as related-to; gate against that threshold
+                if confidence <= self.rel_thresholds.get('related-to', 0.42):
+                    continue
+                key = tuple(sorted([entity['text'], other['text']]) + ['related-to'])
                 if key in rel_keys:
                     continue
                 rel_keys.add(key)
                 relationships.append({
                     'source': entity['text'],
                     'target': other['text'],
-                    'type': 'proximity',
+                    'type': 'related-to',
                     'confidence': confidence,
                     'context': 'proximity_window'
                 })
@@ -720,7 +676,7 @@ class SinhalaNLPEngine:
         return ' '.join(cleaned_words)
 
     def _tokenize(self, text: str) -> List[str]:
-        """Tokenize text with Sinhala-aware pattern."""
+        """Tokenize text with Sinhala-aware pattern (sinling if available, else regex)."""
         if not text:
             return []
         if self.sinling_tokenizer:
@@ -729,6 +685,8 @@ class SinhalaNLPEngine:
                 return [t for t in tokens if t and t.strip()]
             except Exception:
                 pass
+        # Remove zero-width characters then extract Sinhala and Latin tokens
+        text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)
         return self.word_pattern.findall(text)
 
     def _adaptive_cluster_threshold(self, embeddings: np.ndarray, base_threshold: float) -> float:
