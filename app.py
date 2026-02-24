@@ -22,7 +22,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+
+# Restrict CORS to frontend dev origins
+CORS(app, origins=["http://localhost:8081", "http://127.0.0.1:8081"])  # Enable CORS for frontend
 
 # Initialize intelligent mind map generator (AI-powered only)
 intelligent_generator = IntelligentMindMapGenerator()

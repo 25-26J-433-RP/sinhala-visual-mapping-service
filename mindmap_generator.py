@@ -21,6 +21,8 @@ class SinhalaMindMapGenerator:
         self.topic_keywords = ['විෂය', 'මාතෘකා', 'පාඩම', 'අංශය', 'කොටස']
         
     def generate(self, text: str) -> Dict[str, Any]:
+        from sinhala_normalization import normalize_sinhala_text
+        text = normalize_sinhala_text(text)
         """
         Generate a graph-ready mind map from Sinhala text.
         

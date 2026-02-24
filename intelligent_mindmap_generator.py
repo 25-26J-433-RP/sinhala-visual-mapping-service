@@ -13,6 +13,7 @@ from typing import Dict, List, Any, Tuple
 from collections import defaultdict
 from nlp_engine import SinhalaNLPEngine
 from config import Config
+from graph_constraints import GraphConstraints
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,7 @@ class IntelligentMindMapGenerator:
         self.min_relationship_confidence = getattr(Config, 'MIN_RELATIONSHIP_CONFIDENCE', 0.4)
         self.default_max_nodes = getattr(Config, 'MAX_NODES', 50)
         self.default_semantic_clustering = getattr(Config, 'SEMANTIC_CLUSTERING', True)
+        self.graph_constraints = GraphConstraints()
         self.max_nodes_per_level = {
             0: 1,   # Root
             1: 6,   # Main topics
@@ -130,6 +132,13 @@ class IntelligentMindMapGenerator:
 
         # Step 6c: CRITICAL - Deduplicate edges to show only one line between any two nodes
         edges = self._deduplicate_edges(edges)
+
+        # Step 6d: Graph constraint post-processing
+        #   1. Merge near-duplicate nodes
+        #   2. Remove cycles in hierarchy edges
+        #   3. Limit parents per node (max 2 hierarchy parents)
+        #   4. Drop weak cross-cluster soft edges
+        nodes, edges = self.graph_constraints.apply(nodes, edges, cluster_map)
 
         # Step 7: Assign deterministic positions for better layouts
         nodes = self._assign_positions(nodes)
@@ -298,25 +307,40 @@ class IntelligentMindMapGenerator:
                     'weight': 1
                 })
         
-        # Add relationship-based edges with deduplication (undirected canonical key)
-        edge_keys = set()
+        # Add relationship-based edges.
+        # Deduplication key is DIRECTED (source, target, type) so the
+        # correct orientation from the relation classifier is preserved.
+        # When the reverse orientation of the same type was already seen
+        # we keep whichever has the higher direction_score.
+        edge_keys: Dict[tuple, Dict] = {}
         for rel in relationships:
             source_id = node_map.get(rel['source'])
             target_id = node_map.get(rel['target'])
-            
+
             if source_id and target_id and source_id != target_id:
-                key = tuple(sorted([source_id, target_id]) + [rel['type']])
-                if key in edge_keys:
-                    continue
-                edge_keys.add(key)
-                edges.append({
+                fwd_key = (source_id, target_id, rel['type'])
+                rev_key = (target_id, source_id, rel['type'])
+                new_dir = rel.get('direction_score', 0.5)
+                edge_dict = {
                     'id': self._generate_id(),
                     'source': source_id,
                     'target': target_id,
                     'type': rel['type'],
                     'weight': max(1, int(rel['confidence'] * 3)),
-                    'confidence': rel['confidence']
-                })
+                    'confidence': rel['confidence'],
+                    'direction_score': new_dir,
+                    'directed': rel.get('directed', False),
+                }
+                if rev_key in edge_keys:
+                    # Both directions found; keep the one with stronger cue
+                    if new_dir > edge_keys[rev_key].get('direction_score', 0.5):
+                        del edge_keys[rev_key]
+                        edge_keys[fwd_key] = edge_dict
+                elif fwd_key not in edge_keys or \
+                        rel['confidence'] > edge_keys[fwd_key]['confidence']:
+                    edge_keys[fwd_key] = edge_dict
+
+        edges.extend(edge_keys.values())
         
         return nodes, edges
 

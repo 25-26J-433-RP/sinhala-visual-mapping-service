@@ -1,0 +1,3 @@
+{"text": "ජෛව විවිධත්වය පරිසරය සඳහා වැදගත් ය.", "labels": [[0, 15, "multiword-concept"], [16, 27, "non-concept"], [28, 36, "concept"]]}
+{"text": "ග්‍රහ මණ්ඩලය සූර්යයා වටා භ්‍රමණය කරයි.", "labels": [[0, 13, "multiword-concept"], [14, 21, "concept"], [22, 38, "non-concept"]]}
+{"text": "ජලය ජීවීන්ට අත්‍යවශ්‍ය වේ.", "labels": [[0, 5, "concept"], [6, 19, "non-concept"], [20, 32, "concept"]]}

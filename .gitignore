@@ -46,3 +46,9 @@ logs/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Model outputs
+concept-extractor-model/
+
+# Scratch / temporary files
+_smoke_test.py
