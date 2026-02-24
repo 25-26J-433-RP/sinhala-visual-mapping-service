@@ -6,6 +6,7 @@ Uses lightweight models for intelligent node and relationship extraction.
 import re
 import hashlib
 import math
+import os
 import unicodedata
 from typing import List, Dict, Tuple, Set, Any
 import numpy as np
@@ -31,13 +32,18 @@ class SinhalaNLPEngine:
         )
         
         # Initialize sentence transformer for semantic analysis
-        try:
-            from sentence_transformers import SentenceTransformer
-            # Use a lightweight multilingual model that supports Sinhala
-            self.embeddings_model = SentenceTransformer(self.embeddings_model_name)
-            logger.info("Loaded multilingual embeddings model: %s", self.embeddings_model_name)
-        except Exception as e:
-            logger.warning("Could not load embeddings model %s: %s", self.embeddings_model_name, e)
+        # Optional bypass for environments where torch/transformers is unavailable
+        disable_embeddings = os.getenv('DISABLE_SENTENCE_TRANSFORMERS', 'false').lower() == 'true'
+        if disable_embeddings:
+            logger.info("Sentence-transformers disabled via DISABLE_SENTENCE_TRANSFORMERS=true")
+        else:
+            try:
+                from sentence_transformers import SentenceTransformer
+                # Use a lightweight multilingual model that supports Sinhala
+                self.embeddings_model = SentenceTransformer(self.embeddings_model_name)
+                logger.info("Loaded multilingual embeddings model: %s", self.embeddings_model_name)
+            except Exception as e:
+                logger.warning("Could not load embeddings model %s: %s", self.embeddings_model_name, e)
         
         # Try to import sinling for Sinhala NLP
         try:
