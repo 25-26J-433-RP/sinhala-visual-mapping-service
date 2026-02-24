@@ -13,6 +13,7 @@ from collections import defaultdict, Counter
 import logging
 from config import Config
 from hybrid_node_extractor import HybridNodeExtractor
+from relation_classifier import RelationClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,9 @@ class SinhalaNLPEngine:
         # Hybrid node extractor (rule patterns + embeddings + re-ranker)
         self.hybrid_extractor = HybridNodeExtractor(self)
 
+        # Two-stage relation classifier (candidate generation + feature classification)
+        self.relation_classifier = RelationClassifier(self)
+
         # ── Per-relation-type confidence thresholds ───────────────────────────
         # Rationale:
         #   is-a        – requires an explicit definition / example marker; set high
@@ -177,98 +181,80 @@ class SinhalaNLPEngine:
         return entities
     
     def extract_relationships(self, text: str, entities: List[Dict]) -> List[Dict[str, Any]]:
-        from sinhala_normalization import normalize_sinhala_text
-        text = normalize_sinhala_text(text)
         """
-        Extract relationships between entities.
-        
-        Returns:
-            List of relationship dictionaries with source, target, type, and confidence
+        Extract relationships between entities using a two-stage pipeline:
+
+        Stage 1 – Candidate generation
+            Shortlists node pairs via same/adjacent sentence co-occurrence,
+            embedding similarity, and shared n-gram root — avoiding the O(n²)
+            complexity of exhaustive pair enumeration.
+
+        Stage 2 – Relation classification
+            For each shortlisted pair, builds a 14-dim feature vector
+            (lexical markers × context scope, embedding similarity, between-span
+            type similarity, structural distance) and scores it against a
+            calibrated weight matrix.  A softmax gives a probability distribution
+            over the four canonical types; the argmax is the predicted relation
+            and its probability is the confidence.
+
+        Per-type thresholds (``self.rel_thresholds``) are applied after
+        classification to suppress weak predictions.
+
+        Returns
+        -------
+        List[Dict]
+            Relationship dicts with keys: ``source``, ``target``, ``type``,
+            ``confidence``, ``context``, ``feature_scores``.
+        """
+        from sinhala_normalization import normalize_sinhala_text
+        text = normalize_sinhala_text(self._normalize_unicode(text))
+        try:
+            return self.relation_classifier.classify(text, entities)
+        except Exception as exc:
+            logger.warning(
+                "RelationClassifier failed (%s); falling back to heuristic.", exc
+            )
+            return self._extract_relationships_heuristic(text, entities)
+
+    def _extract_relationships_heuristic(
+        self, text: str, entities: List[Dict]
+    ) -> List[Dict[str, Any]]:
+        """
+        Legacy heuristic relationship extraction (fallback only).
+
+        Used when the supervised relation classifier raises an unexpected error.
         """
         relationships = []
         sentences = self._split_sentences_with_spans(text)
-        entity_texts = {e['text'] for e in entities}
-        rel_keys = set()
-        
+        rel_keys: set = set()
+
         for sentence, sent_start in sentences:
             sent_end = sent_start + len(sentence)
-            # Find entities that fall inside this sentence span
             sentence_entities = [
                 e for e in entities
                 if e.get('offset', -1) >= sent_start and e.get('offset', -1) < sent_end
             ]
-            
-            if len(sentence_entities) >= 2:
-                # Extract relationships between entities in the same sentence
-                for i in range(len(sentence_entities)):
-                    for j in range(i + 1, len(sentence_entities)):
-                        entity1 = sentence_entities[i]
-                        entity2 = sentence_entities[j]
-                        
-                        # Determine relationship type and strength
-                        raw_type, confidence = self._analyze_relationship(
-                            entity1['text'], entity2['text'], sentence,
-                            entity1.get('offset'), entity2.get('offset')
-                        )
-                        rel_type = self.rel_type_canonical.get(raw_type, 'related-to')
-                        threshold = self.rel_thresholds.get(rel_type, 0.45)
-
-                        if confidence > threshold:
-                            key = tuple(sorted([entity1['text'], entity2['text']]) + [rel_type])
-                            # Keep the strongest confidence for duplicate pairs
-                            existing = next((r for r in relationships if r.get('key') == key), None)
-                            if existing:
-                                existing['confidence'] = max(existing['confidence'], confidence)
-                            else:
-                                relationships.append({
-                                    'source': entity1['text'],
-                                    'target': entity2['text'],
-                                    'type': rel_type,
-                                    'confidence': confidence,
-                                    'context': sentence,
-                                    'key': key
-                                })
-                            rel_keys.add(key)
-
-        # Add proximity-based cross-sentence/co-occurrence relationships (LIMITED for cleaner graphs)
-        # REDUCED: Only add very close proximity relationships to avoid clutter
-        ordered_entities = [e for e in entities if e.get('offset') is not None]
-        ordered_entities.sort(key=lambda x: x.get('offset', 10**9))
-
-        for i, entity in enumerate(ordered_entities[:-1]):
-            # REDUCED: Only check next 2 entities instead of 4
-            for j in range(i + 1, min(i + 2, len(ordered_entities))):
-                other = ordered_entities[j]
-                if entity['text'] == other['text']:
-                    continue
-                # Minimum semantic similarity gate for proximity edges
-                _prox_sim_gate = self.rel_thresholds.get('related-to', 0.42)
-                if self.compute_semantic_similarity(entity['text'], other['text']) < _prox_sim_gate:
-                    continue
-                # Distance-based confidence (closer concepts get higher weight)
-                distance = abs(entity.get('offset', 0) - other.get('offset', 0))
-                # Limit to very nearby co-occurrences
-                if distance > 100:
-                    break
-                confidence = max(0.5, 0.95 - (distance / 200.0))
-                # Proximity edges are classified as related-to; gate against that threshold
-                if confidence <= self.rel_thresholds.get('related-to', 0.42):
-                    continue
-                key = tuple(sorted([entity['text'], other['text']]) + ['related-to'])
-                if key in rel_keys:
-                    continue
-                rel_keys.add(key)
-                relationships.append({
-                    'source': entity['text'],
-                    'target': other['text'],
-                    'type': 'related-to',
-                    'confidence': confidence,
-                    'context': 'proximity_window'
-                })
-        
-        # Remove helper keys before returning
-        for r in relationships:
-            r.pop('key', None)
+            if len(sentence_entities) < 2:
+                continue
+            for i in range(len(sentence_entities)):
+                for j in range(i + 1, len(sentence_entities)):
+                    e1, e2 = sentence_entities[i], sentence_entities[j]
+                    raw_type, confidence = self._analyze_relationship(
+                        e1['text'], e2['text'], sentence,
+                        e1.get('offset'), e2.get('offset')
+                    )
+                    rel_type = self.rel_type_canonical.get(raw_type, 'related-to')
+                    threshold = self.rel_thresholds.get(rel_type, 0.45)
+                    if confidence <= threshold:
+                        continue
+                    key = tuple(sorted([e1['text'], e2['text']]) + [rel_type])
+                    if key not in rel_keys:
+                        rel_keys.add(key)
+                        relationships.append({
+                            'source': e1['text'], 'target': e2['text'],
+                            'type': rel_type, 'confidence': confidence,
+                            'context': sentence,
+                        })
         return relationships
     
     def compute_semantic_similarity(self, text1: str, text2: str) -> float:
