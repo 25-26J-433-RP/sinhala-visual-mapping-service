@@ -102,7 +102,267 @@ _MARKERS: Dict[str, List[str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Calibrated weight matrix
+# Directionality cue tables
+# ---------------------------------------------------------------------------
+
+# Postpositions / particles that reveal the role of the word that PRECEDES them.
+# Format:  token → role assigned to the preceding entity
+#   'cause_src'   – preceding entity is the CAUSE   (source in cause-effect)
+#   'cause_tgt'   – preceding entity is the EFFECT  (target in cause-effect)
+#   'isa_child'   – preceding entity is the CHILD/SUBTYPE (source in is-a)
+#   'part_part'   – preceding entity is the PART    (source in part-of)
+#   'part_whole'  – preceding entity is the WHOLE   (target in part-of)
+#   'agent'       – preceding entity is the AGENT   (source, any relation)
+_POST_ROLE: Dict[str, str] = {
+    # causal cues (cause precedes cue)
+    'නිසා':          'cause_src',
+    'හේතුවෙන්':      'cause_src',
+    'ප්‍රතිඵලයෙන්':   'cause_src',
+    'ඒ හේතුවෙන්':    'cause_src',
+    'මගින්':         'cause_src',
+    # agent marker
+    'විසින්':        'agent',
+    # definitional (child precedes cue)
+    'යනු':          'isa_child',
+    'හෙවත්':        'isa_child',
+    'ලෙස':          'isa_child',
+    'ලෙසින්':       'isa_child',
+    'ලෙස හඳුන්වේ':  'isa_child',
+    'ලෙස නිර්වචනය': 'isa_child',
+    # genitive → preceding word is the WHOLE (target of part-of)
+    'ගේ':           'part_whole',
+    'හි':           'part_whole',
+    'ල':            'part_whole',
+    'වල':           'part_whole',
+    # part markers → preceding word is the PART (source of part-of)
+    'කොටසකි':       'part_part',
+    'කොටසක්':      'part_part',
+    'කොටස':        'part_part',
+    'අංශය':        'part_part',
+    'ශාඛාව':        'part_part',
+    'අයිතිය':       'part_part',
+}
+
+# Verb/predicate patterns that, when they appear AFTER an entity, signal
+# that the entity just BEFORE the verb is the EFFECT / product (target).
+_EFFECT_VERBS: List[str] = [
+    'ඇතිවේ', 'ජනනය', 'නිෂ්පාදනය', 'ඇති කරයි', 'සිදු කරයි',
+    'ලබා දෙයි', 'ලබා ගනී', 'කෙරේ', 'වේ', 'ඇති', 'ශාකය',
+]
+
+# If an entity precedes one of these verbs, it is the AGENT/CAUSE (source).
+_AGENT_VERBS: List[str] = [
+    'නිෂ්පාදනය කරයි', 'ජනනය කරයි', 'ඇති කරයි', 'ලබා දෙයි',
+    'ඉදිරිපත් කරයි', 'නිපදවයි', 'ඇතිකරයි',
+]
+
+
+class DirectionResolver:
+    """
+    Resolve the correct directed orientation (source → target) of a
+    candidate relationship using Sinhala-specific syntax cues.
+
+    Cue layers applied in priority order
+    -------------------------------------
+    1. **Strong postposition cues** – explicit role-marking particles
+       (e.g. ``නිසා`` marks the preceding token as CAUSE).
+    2. **Verb-pattern cues** – transitive verbs reveal agent (before verb)
+       and patient/effect (after verb) using Sinhala SOV order.
+    3. **Linear-order heuristic** – in the absence of syntactic evidence,
+       the entity appearing earlier in the sentence is the source
+       (Sinhala topic-comment structure puts the topic first).
+
+    The resolver returns ``(source_text, target_text, direction_score)``
+    where ``direction_score ∈ [0, 1]`` reflects how certain the orientation
+    decision is (1.0 = explicit cue, 0.5 = fallback linear order).
+    """
+
+    # ── Type → applicable cue roles ──────────────────────────────────────
+    _SRC_ROLES = {
+        REL_IS_A:     {'isa_child', 'agent'},
+        REL_PART_OF:  {'part_part'},
+        REL_CAUSE:    {'cause_src', 'agent'},
+        REL_RELATED:  set(),  # linear order only
+    }
+    _TGT_ROLES = {
+        REL_IS_A:     set(),
+        REL_PART_OF:  {'part_whole'},
+        REL_CAUSE:    {'cause_tgt'},
+        REL_RELATED:  set(),
+    }
+
+    def resolve(
+        self,
+        e1: Dict[str, Any],
+        e2: Dict[str, Any],
+        rel_type: str,
+        sentence: str,
+        between: str,
+    ) -> Tuple[str, str, float]:
+        """
+        Return ``(source_text, target_text, direction_score)``.
+
+        Parameters
+        ----------
+        e1, e2     : entity dicts from the hybrid extractor
+        rel_type   : canonical relation type string
+        sentence   : the context sentence containing both entities
+        between    : text span lying between e1 and e2 in the sentence
+        """
+        t1, t2 = e1['text'], e2['text']
+        off1 = e1.get('offset', 0)
+        off2 = e2.get('offset', 0)
+
+        # ── Layer 1: postposition scanning ───────────────────────────────
+        role1 = self._postposition_role(t1, sentence)
+        role2 = self._postposition_role(t2, sentence)
+
+        src_roles = self._SRC_ROLES.get(rel_type, set())
+        tgt_roles = self._TGT_ROLES.get(rel_type, set())
+
+        # Case: e1 is explicitly marked as source
+        if role1 in src_roles and role2 not in src_roles:
+            return t1, t2, 0.90
+        # Case: e2 is explicitly marked as source
+        if role2 in src_roles and role1 not in src_roles:
+            return t2, t1, 0.90
+        # Case: e1 marked as target (whole in part-of)
+        if role1 in tgt_roles and role2 not in tgt_roles:
+            return t2, t1, 0.88
+        # Case: e2 marked as target
+        if role2 in tgt_roles and role1 not in tgt_roles:
+            return t1, t2, 0.88
+
+        # ── Layer 2: verb-pattern scanning ───────────────────────────────
+        verb_src, verb_tgt, verb_score = self._verb_pattern_role(
+            t1, t2, sentence, rel_type
+        )
+        if verb_src is not None:
+            return verb_src, verb_tgt, verb_score
+
+        # ── Layer 3: linear order (SOV topic-first heuristic) ────────────
+        # Between-span cue: if a cause marker appears between e1 and e2,
+        # the entity BEFORE the marker is the cause.
+        cause_in_between = any(m in between for m in [
+            'නිසා', 'හේතුවෙන්', 'ප්‍රතිඵලයෙන්', 'විසින්'
+        ])
+        if rel_type == REL_CAUSE and cause_in_between:
+            # The entity that appears BEFORE the causal marker is the source
+            src, tgt = (t1, t2) if off1 < off2 else (t2, t1)
+            return src, tgt, 0.75
+
+        # Default: earlier in text → source (topic-comment order)
+        if off1 <= off2:
+            return t1, t2, 0.50
+        return t2, t1, 0.50
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _postposition_role(entity_text: str, sentence: str) -> Optional[str]:
+        """
+        Find the postposition token that immediately follows *entity_text*
+        in *sentence* and return its assigned role, or None.
+
+        Two passes are performed:
+
+        1. Space-separated postpositions: scan up to 30 chars after the
+           entity, strip leading whitespace, and check ``startswith``.
+        2. Merged (suffix-attached) forms: Sinhala often agglutinates the
+           postposition directly onto the noun without a space
+           (e.g. "ගස" + "ේ" → "ගසේ").  Check whether *entity_text* +
+           known suffix appears verbatim in the sentence.
+        """
+        idx = sentence.find(entity_text)
+        if idx == -1:
+            return None
+
+        # Pass 1: space-separated lookup
+        after = sentence[idx + len(entity_text): idx + len(entity_text) + 30].strip()
+        for token, role in sorted(_POST_ROLE.items(), key=lambda x: -len(x[0])):
+            if after.startswith(token):
+                return role
+
+        # Pass 2: merged suffix lookup (longest-first)
+        # These are the phonological suffixes that directly agglutinate
+        # onto the noun stem in Sinhala:
+        #   ේ  / ගේ  → genitive (whole in part-of)
+        #   හි         → locative/genitive (whole)
+        #   ල          → genitive alternative
+        #   නිසා       → causal (sometimes written without space)
+        #   විසින්     → agentive
+        _MERGED: List[Tuple[str, str]] = sorted([
+            ("ගේ",     "part_whole"),
+            ("නිසා",   "cause_src"),
+            ("විසින්", "agent"),
+            ("හේතුවෙන්", "cause_src"),
+            ("හි",     "part_whole"),
+            ("ල",      "part_whole"),
+            ("ේ",      "part_whole"),
+        ], key=lambda x: -len(x[0]))
+        for suffix, role in _MERGED:
+            if (entity_text + suffix) in sentence:
+                return role
+
+        return None
+
+    @staticmethod
+    def _verb_pattern_role(
+        t1: str, t2: str, sentence: str, rel_type: str
+    ) -> Tuple[Optional[str], Optional[str], float]:
+        """
+        Use Sinhala SOV verb patterns to assign agent (source) and
+        patient/effect (target).
+
+        Returns ``(source, target, score)`` where source/target are text
+        strings, or ``(None, None, 0.0)`` if no verb cue fired.
+        """
+        if rel_type not in (REL_CAUSE, REL_IS_A):
+            return None, None, 0.0
+
+        idx1 = sentence.find(t1)
+        idx2 = sentence.find(t2)
+        if idx1 == -1 or idx2 == -1:
+            return None, None, 0.0
+
+        # Agent verb: entity before this verb is the agent (source)
+        for av in _AGENT_VERBS:
+            av_idx = sentence.find(av)
+            if av_idx == -1:
+                continue
+            # Whichever entity ends just before the verb is the agent
+            end1 = idx1 + len(t1)
+            end2 = idx2 + len(t2)
+            if end1 <= av_idx and (end2 > av_idx or end2 < end1):
+                return t1, t2, 0.80
+            if end2 <= av_idx and (end1 > av_idx or end1 < end2):
+                return t2, t1, 0.80
+
+        # Effect verb: entity before the verb is the EFFECT (target);
+        # the other entity is the CAUSE (source).
+        for ev in _EFFECT_VERBS:
+            ev_idx = sentence.find(ev)
+            if ev_idx == -1:
+                continue
+            end1 = idx1 + len(t1)
+            end2 = idx2 + len(t2)
+            # Entity whose end is closest-before the effect verb is the EFFECT (target)
+            gap1 = ev_idx - end1 if end1 <= ev_idx else 9999
+            gap2 = ev_idx - end2 if end2 <= ev_idx else 9999
+            if gap1 < gap2 and gap1 < 40:
+                # t1 is effect (target), t2 is cause (source)
+                return t2, t1, 0.78
+            if gap2 < gap1 and gap2 < 40:
+                # t2 is effect (target), t1 is cause (source)
+                return t1, t2, 0.78
+
+        return None, None, 0.0
+
+
+# Module-level singleton constructed on first use inside RelationClassifier
+_direction_resolver = DirectionResolver()
+
+
 # Rows → canonical types  |  Columns → feature dimensions (see _feature_names)
 #
 # Feature dimensions (14 total):
@@ -218,8 +478,20 @@ class RelationClassifier:
             threshold = self.engine.rel_thresholds.get(rel["type"], 0.45)
             if rel["confidence"] < threshold:
                 continue
-            key = tuple(sorted([rel["source"], rel["target"]]) + [rel["type"]])
-            if key not in relationships or relationships[key]["confidence"] < rel["confidence"]:
+            # Use DIRECTED key: (source, target, type) — preserves orientation.
+            # If the same undirected pair was seen with higher confidence,
+            # keep that, but also allow both (A→B) and (B→A) if they survive
+            # with different detected types.
+            key = (rel["source"], rel["target"], rel["type"])
+            rev_key = (rel["target"], rel["source"], rel["type"])
+            # Prefer the orientation with the highest direction_score
+            if rev_key in relationships:
+                existing = relationships[rev_key]
+                if rel["direction_score"] > existing["direction_score"]:
+                    del relationships[rev_key]
+                    relationships[key] = rel
+                # else keep existing orientation
+            elif key not in relationships or relationships[key]["confidence"] < rel["confidence"]:
                 relationships[key] = rel
 
         result = sorted(relationships.values(), key=lambda r: r["confidence"], reverse=True)
@@ -392,11 +664,18 @@ class RelationClassifier:
         if confidence < 0.30:
             return None
 
+        # ── Stage 3: Resolve directionality ─────────────────────────────────
+        source, target, dir_score = _direction_resolver.resolve(
+            e1, e2, rel_type, context, between
+        )
+
         return {
-            "source": e1["text"],
-            "target": e2["text"],
+            "source": source,
+            "target": target,
             "type": rel_type,
             "confidence": round(confidence, 4),
+            "direction_score": round(dir_score, 4),
+            "directed": dir_score > 0.60,
             "context": context,
             "feature_scores": {
                 REL_IS_A:    round(float(probs[0]), 4),
