@@ -23,42 +23,137 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+# Import morphology handler for inflection normalization
+try:
+    from sinhala_morphology import get_morphology_handler, normalize_sinhala_word, split_compound_word
+    MORPHOLOGY_AVAILABLE = True
+except ImportError:
+    logger.warning("sinhala_morphology not available - skipping morphology normalization")
+    MORPHOLOGY_AVAILABLE = False
+    def normalize_sinhala_word(word): return word
+    def split_compound_word(word): return [word]
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Sinhala concept anchor vocabulary
+# Sinhala concept anchor vocabulary (EXPANDED)
 # These serve as the *reference concept space* for embedding scoring.
 # A candidate scores high when its embedding is close to any anchor.
+# ENHANCED: 150+ terms covering education, essay-writing, and broader domains
 # ---------------------------------------------------------------------------
 _SINHALA_CONCEPT_ANCHORS: List[str] = [
     # Biology / Science
     "ශාකය", "ජීවියා", "ක්‍රියාවලිය", "ඉන්ද්‍රිය", "පද්ධතිය",
     "ශ්‍රිතය", "ව්‍යුහය", "ලක්ෂණය", "ක්‍රමය", "සංකල්පය",
     "නිෂ්පාදනය", "ශක්තිය", "ද්‍රව්‍යය", "ජලය", "ගසය",
-    "ප්‍රතික්‍රියාව", "ශරීරය", "ව්‍යාධිය", "රසායනය",
+    "ප්‍රතික්‍රියාව", "ශරීරය", "ව්‍යාධිය", "රසායනය", "පරිසරය",
+    "සත්වයා", "ජීවිතය", "පෝෂණය", "ව්‍යාධිය", "ඖෂධය",
+    
     # Social Sciences / Economics
     "ආර්ථිකය", "සමාජය", "රටාව", "ප්‍රතිපත්තිය", "නීතිය",
-    "අධ්‍යාපනය", "ආයතනය", "ව්‍යාපාරය",
+    "අධ්‍යාපනය", "ආයතනය", "ව්‍යාපාරය", "රජය", "පාලනය",
+    "සංස්කෘතිය", "ඉතිහාසය", "භූගෝලය", "ජනතාව", "ප්‍රජාව",
+    
     # Technology / Computing
     "ගණකය", "ජාලය", "මෘදුකාංගය", "දෘඩාංගය", "ඇල්ගොරිතමය",
-    "ක්‍රමලේඛනය", "දත්ත", "ආකෘතිය",
+    "ක්‍රමලේඛනය", "දත්ත", "ආකෘතිය", "තාක්ෂණය", "පද්ධතිය",
+    "අන්තර්ජාලය", "යෙදුම", "ප්‍රොටෝකෝලය",
+    
     # General academic
     "සිද්ධාන්තය", "නිර්වචනය", "ප්‍රකාශය", "ලක්ෂය", "ගුණාංගය",
-    "ගණිතය", "භෞතිකය", "ජීව විද්‍යාව",
+    "ගණිතය", "භෞතිකය", "ජීව විද්‍යාව", "රසායන විද්‍යාව",
+    "පර්යේෂණය", "අධ්‍යයනය", "විශ්ලේෂණය", "ප්‍රවණතාව",
+    
+    # Education & Essay Writing (NEW)
+    "රචනය", "ඡේදය", "වාක්‍යය", "විෂයය", "තේමාව",
+    "විස්තරය", "උදාහරණය", "තර්කය", "මතය", "අදහස",
+    "නිගමනය", "හැඳින්වීම", "විග්‍රහය", "සාක්ෂිය", "සාධකය",
+    "ශීර්ෂය", "මාතෘකාව", "අනුච්ඡේදය", "ප්‍රකාශනය",
+    "ලේඛනය", "කថනය", "ප්‍රකාශය", "සාරාංශය", "විස්තරය",
+    "තොරතුරු", "දැනුම", "අර්ථය", "අර්ථකථනය", "විවරණය",
+    
+    # Literature & Language
+    "භාෂාව", "සාහිත්‍යය", "කවිය", "කතාව", "නවකතාව",
+    "චරිතය", "පුවතය", "මානය", "ශෛලිය", "ප්‍රබන්ධය",
+    "වචනය", "අක්ෂරය", "ව්‍යාකරණය", "උච්චාරණය",
+    
+    # Philosophy & Ethics
+    "දර්ශනය", "සදාචාරය", "ආචාර ධර්මය", "යුක්තිය", "සත්‍යය",
+    "හිතය", "චින්තනය", "බුද්ධිය", "තර්කනය", "විවේචනය",
+    
+    # Geography & Environment
+    "දිවයින", "රට", "නගරය", "ගම", "ප්‍රදේශය",
+    "කලාපය", "දේශගුණය", "කාලගුණය", "භූමිය", "සාගරය",
+    "පර්වතය", "ගඟ", "වනාන්තරය", "වාතාවරණය",
+    
+    # Arts & Culture
+    "කලාව", "සංගීතය", "නර්තනය", "පින්තූරය", "මූර්ති",
+    "චිත්‍රපටය", "නාට්‍යය", "රූප විලාසය", "සැලසුම",
+    
+    # Mathematics & Logic
+    "සංඛ්‍යාව", "ගණනය", "සූත්‍රය", "සමීකරණය", "අනුපාතය",
+    "ප්‍රමාණය", "මිණුම", "හැඩය", "ත්‍රිකෝණය", "වෘත්තය",
+    
+    # Psychology & Behavior
+    "මනස", "හැසිරීම", "චිත්තය", "සිතිවිලි", "හැඟීම්",
+    "මතකය", "අත්දැකීම", "ප්‍රතික්‍රියාව", "ආකල්පය",
+    
+    # Health & Medicine
+    "සෞඛ්‍යය", "ආරෝග්‍යය", "රෝගය", "ප්‍රතිකාරය", "වෛද්‍යය",
+    "පෝෂණය", "ව්‍යායාමය", "සෞඛ්‍ය සම්පන්නත්වය",
+    
+    # Time & History
+    "කාලය", "යුගය", "සමය", "කාලපරිච්ඡේදය", "අතීතය",
+    "වර්තමානය", "අනාගතය", "සිදුවීම", "සිදුවීම", "සංසිද්ධිය",
+    
+    # Abstract Concepts (Crucial for Essays)
+    "සංකල්පය", "මූලධර්මය", "මූලධර්මය", "ප්‍රතිපාදනය",
+    "හේතුව", "ප්‍රතිඵලය", "බලපෑම", "ප්‍රගතිය", "සංවර්ධනය",
+    "වෙනස", "වෙනසක්", "මට්ටම", "අවධිය", "පියවර",
+    "ක්‍රමවේදය", "ප්‍රවේශය", "රටාව", "ව්‍යුහය", "පද්ධතිය",
+    "අරමුණ", "අරමුණු", "ඉලක්කය", "පරමාර්ථය", "අභිප්‍රාය",
+    "ගැටලුව", "අභියෝගය", "විසඳුම", "ප්‍රධානත්වය", "වැදගත්කම",
 ]
 
-# Sinhala common noun suffixes (high weight when a word ends with these)
+# ENHANCED Sinhala noun suffixes (expanded for better coverage)
 _NOUN_SUFFIX_RE = re.compile(
-    r"(ය$|ව$|ම$|ක$|ය්$|ව්$|ද$|ත$|ල$|ලා$|ස$|ස්$|ිය$|ීය$|ාව$|ාය$|ීම$|ීමට$|ේ$|ොව$)"
+    r"(ය$|ව$|ම$|ක$|ය්$|ව්$|ද$|ත$|ල$|ලා$|ස$|ස්$|"
+    r"ිය$|ීය$|ාව$|ාය$|ීම$|ීමට$|ේ$|ොව$|"
+    r"ත්ව$|කම$|කම්$|බව$|හික$|මය$|නය$|ද්ධිය$|"
+    r"ත්වය$|කම$|තාව$|භාවය$|යත$|යට$|"
+    r"ඤාණය$|ක්රමය$|වාදය$|ධර්මය$)"
 )
 
-# Verb-form endings that should *penalise* a word
+# ENHANCED Verb-form endings (expanded for better filtering)
 _VERB_ENDING_RE = re.compile(
-    r"(නවා$|ෙයි$|ෙනවා$|ිනවා$|ීවා$|ූවා$|ාවා$|ෙනු$|ෙන$|ෙමු$|ෙහෙ$|ෙනවාය$)"
+    r"(නවා$|ෙයි$|ෙනවා$|ිනවා$|ීවා$|ූවා$|ාවා$|"
+    r"ෙනු$|ෙන$|ෙමු$|ෙහෙ$|ෙනවාය$|"
+    r"මින්$|මි$|මු$|ති$|න්න$|ල$|"
+    r"ගන්නා$|දෙන$|කරන$|කළ$|ගත්$|ගත$|"
+    r"යි$|යී$|යාය$|යා$|යෙව්$)"
 )
 
 # Embedded Latin technical terms (almost always concepts)
 _LATIN_TERM_RE = re.compile(r"\b[A-Z][a-zA-Z]{2,}\b")
+
+# Domain-specific essay/education patterns
+_EDUCATION_PATTERNS = [
+    r"(අධ්‍යාපන\s+\S+)",  # education + word
+    r"(ඉගෙනීම\s+\S+)",    # learning + word
+    r"(ගුරු\s+\S+)",       # teacher + word
+    r"(ශිෂ්‍ය\s+\S+)",     # student + word
+    r"(රචනා\s+\S+)",      # essay + word
+    r"(පාසල්\s+\S+)",     # school + word
+    r"(විෂය\s+\S+)",      # subject + word
+]
+
+_COMPOUND_PATTERNS = [
+    r"(\S+\s+ක්‍රමය)",    # method/system
+    r"(\S+\s+පද්ධතිය)",  # system
+    r"(\S+\s+ක්‍රියාවලිය)", # process
+    r"(\S+\s+ව්‍යාපෘතිය)", # project
+    r"(\S+\s+සංවර්ධනය)",  # development
+]
 
 
 class HybridNodeExtractor:
@@ -166,9 +261,10 @@ class HybridNodeExtractor:
 
         Sources (in order, merged into a single candidate pool):
         a) Single-word noun heuristics
-        b) Multi-word sliding-window noun chunks (2–4 tokens)
-        c) Embedded Latin technical terms
-        d) Sinling NP chunker (optional, best-effort)
+        b) Multi-word sliding-window noun chunks (EXTENDED: 2–6 tokens)
+        c) Compound word splitting (morphology-based)
+        d) Embedded Latin technical terms
+        e) Sinling NP chunker (optional, best-effort)
         """
         engine = self.engine
         sentences: List[Tuple[str, int]] = engine._split_sentences_with_spans(text)
@@ -204,11 +300,12 @@ class HybridNodeExtractor:
                         "concept", rule_score, freq_map, text
                     )
 
-            # ── (b) Multi-word noun chunks ───────────────────────────────────
+            # ── (b) Multi-word noun chunks (EXTENDED 2-6 tokens) ─────────
             for i in range(n):
                 if words[i] in engine.stop_words or len(words[i]) < 3:
                     continue
-                for j in range(i + 2, min(i + 5, n + 1)):
+                # EXTENDED: Now supports 2-6 token phrases (was 2-4)
+                for j in range(i + 2, min(i + 7, n + 1)):
                     phrase = " ".join(words[i:j])
                     if engine._is_stop_phrase(phrase):
                         continue
@@ -216,13 +313,41 @@ class HybridNodeExtractor:
                     # Boost when the tail word carries a noun suffix
                     if _NOUN_SUFFIX_RE.search(words[j - 1]):
                         rule_score = min(1.0, rule_score + 0.08)
+                    # ENHANCED: Extra boost for education/compound patterns
+                    phrase_lower = phrase.lower()
+                    for pattern in _EDUCATION_PATTERNS + _COMPOUND_PATTERNS:
+                        if re.search(pattern, phrase_lower):
+                            rule_score = min(1.0, rule_score + 0.10)
+                            break
                     if rule_score >= self._RULE_GATE:
                         self._upsert(
                             candidates, phrase, sentence, sent_start,
                             "concept_phrase", rule_score, freq_map, text
                         )
+            
+            # ── (c) Compound word splitting (ENHANCED) ───────────────────────
+            # Split compound words and add components as candidates
+            if MORPHOLOGY_AVAILABLE:
+                for idx, word in enumerate(words):
+                    if len(word) < 5:  # Skip short words unlikely to be compounds
+                        continue
+                    components = split_compound_word(word)
+                    if len(components) > 1:  # Successfully split
+                        for comp in components:
+                            if (comp not in engine.stop_words and 
+                                len(comp) >= 3 and 
+                                comp not in engine.weak_words):
+                                # Assign moderate rule score for compound components
+                                rule_score = 0.35
+                                if _NOUN_SUFFIX_RE.search(comp):
+                                    rule_score = min(1.0, rule_score + 0.10)
+                                if rule_score >= self._RULE_GATE:
+                                    self._upsert(
+                                        candidates, comp, sentence, sent_start,
+                                        "compound_component", rule_score, freq_map, text
+                                    )
 
-            # ── (c) Embedded Latin technical terms ───────────────────────────
+            # ── (d) Embedded Latin technical terms ───────────────────────────
             for m in _LATIN_TERM_RE.finditer(sentence):
                 term = m.group()
                 # Technical terms in a Sinhala essay are almost always concepts
@@ -231,7 +356,7 @@ class HybridNodeExtractor:
                     "technical_term", 0.65, freq_map, text
                 )
 
-        # ── (d) Sinling NP chunker (optional) ───────────────────────────────
+        # ── (e) Sinling NP chunker (optional) ───────────────────────────────
         self._add_sinling_chunks(text, candidates, freq_map)
 
         return list(candidates.values())
@@ -458,14 +583,24 @@ class HybridNodeExtractor:
         """
         Remove candidates that are:
         * strict sub-strings of a higher-ranked candidate, OR
-        * exact duplicates by normalised key.
+        * exact duplicates by normalised key, OR
+        * ENHANCED: inflected forms of the same root (when morphology available)
         """
         seen_keys: set = set()
         seen_texts: List[str] = []
+        seen_roots: set = set()  # ENHANCED: Track morphological roots
         result: List[Dict[str, Any]] = []
 
         for c in ranked:
             key = c.get("normalized") or self.engine._normalize_term(c["text"]) or c["text"]
+            
+            # ENHANCED: Check morphological root
+            if MORPHOLOGY_AVAILABLE:
+                root = normalize_sinhala_word(c["text"])
+                if root in seen_roots:
+                    continue
+                seen_roots.add(root)
+            
             if key in seen_keys:
                 continue
             # Suppress if a longer, already-accepted phrase subsumes this text

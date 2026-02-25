@@ -7,6 +7,7 @@ import re
 import hashlib
 import math
 import os
+import sys
 import unicodedata
 from typing import List, Dict, Tuple, Set, Any
 import numpy as np
@@ -17,6 +18,107 @@ from hybrid_node_extractor import HybridNodeExtractor
 from relation_classifier import RelationClassifier
 
 logger = logging.getLogger(__name__)
+
+
+class CachedEmbeddingModel:
+    """Thin LRU-style cache wrapper around a sentence-transformer model."""
+
+    def __init__(self, model: Any, max_cache_size: int = 4096):
+        self.model = model
+        self.max_cache_size = max_cache_size
+        self._cache: Dict[str, np.ndarray] = {}
+        self._cache_order: List[str] = []
+
+    def _touch(self, key: str) -> None:
+        if key in self._cache_order:
+            self._cache_order.remove(key)
+        self._cache_order.append(key)
+        while len(self._cache_order) > self.max_cache_size:
+            evict_key = self._cache_order.pop(0)
+            self._cache.pop(evict_key, None)
+
+    def encode(self, texts, **kwargs):
+        if isinstance(texts, str):
+            texts = [texts]
+            single_input = True
+        else:
+            single_input = False
+
+        result: List[np.ndarray] = []
+        uncached_indices: List[int] = []
+        uncached_texts: List[str] = []
+
+        for idx, text in enumerate(texts):
+            key = text or ""
+            if key in self._cache:
+                result.append(self._cache[key])
+                self._touch(key)
+            else:
+                result.append(None)
+                uncached_indices.append(idx)
+                uncached_texts.append(key)
+
+        if uncached_texts:
+            new_embs = self.model.encode(uncached_texts, **kwargs)
+            new_embs = np.asarray(new_embs)
+            for idx, emb in zip(uncached_indices, new_embs):
+                key = texts[idx] or ""
+                vec = np.asarray(emb, dtype=np.float32)
+                self._cache[key] = vec
+                self._touch(key)
+                result[idx] = vec
+
+        out = np.vstack(result) if result else np.array([], dtype=np.float32)
+        return out[0] if single_input else out
+
+
+class TransformerMeanPoolingEmbedder:
+    """Fallback embedding backend using transformers + torch mean pooling."""
+
+    def __init__(self, model_name: str):
+        from transformers import AutoModel, AutoTokenizer
+        import torch
+
+        self.torch = torch
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.eval()
+
+    def encode(self, texts, **kwargs):
+        if isinstance(texts, str):
+            texts = [texts]
+            single_input = True
+        else:
+            single_input = False
+
+        batch_size = int(kwargs.get('batch_size', 32))
+        convert_to_numpy = kwargs.get('convert_to_numpy', True)
+        all_embs: List[np.ndarray] = []
+
+        with self.torch.no_grad():
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                tokens = self.tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    max_length=256,
+                    return_tensors='pt',
+                )
+                outputs = self.model(**tokens)
+                token_embeddings = outputs.last_hidden_state
+                attention_mask = tokens['attention_mask'].unsqueeze(-1)
+                masked = token_embeddings * attention_mask
+                summed = masked.sum(dim=1)
+                counts = attention_mask.sum(dim=1).clamp(min=1)
+                emb = summed / counts
+                emb = self.torch.nn.functional.normalize(emb, p=2, dim=1)
+                all_embs.append(emb.detach().cpu().numpy().astype(np.float32))
+
+        result = np.vstack(all_embs) if all_embs else np.array([], dtype=np.float32)
+        if convert_to_numpy:
+            return result[0] if single_input else result
+        return result[0] if single_input else result
 
 
 class SinhalaNLPEngine:
@@ -31,6 +133,9 @@ class SinhalaNLPEngine:
             Config, 'EMBEDDINGS_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2'
         )
         
+        # Lightweight Sinhala synonym lexicon (WordNet-style fallback)
+        self.sinhala_synonyms: Dict[str, Set[str]] = self._load_sinhala_synonyms()
+
         # Initialize sentence transformer for semantic analysis
         # Optional bypass for environments where torch/transformers is unavailable
         disable_embeddings = os.getenv('DISABLE_SENTENCE_TRANSFORMERS', 'false').lower() == 'true'
@@ -38,12 +143,33 @@ class SinhalaNLPEngine:
             logger.info("Sentence-transformers disabled via DISABLE_SENTENCE_TRANSFORMERS=true")
         else:
             try:
+                os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
                 from sentence_transformers import SentenceTransformer
                 # Use a lightweight multilingual model that supports Sinhala
-                self.embeddings_model = SentenceTransformer(self.embeddings_model_name)
+                base_model = SentenceTransformer(self.embeddings_model_name, device='cpu')
+                self.embeddings_model = CachedEmbeddingModel(base_model)
                 logger.info("Loaded multilingual embeddings model: %s", self.embeddings_model_name)
             except Exception as e:
-                logger.warning("Could not load embeddings model %s: %s", self.embeddings_model_name, e)
+                logger.warning(
+                    "Could not load embeddings model %s on Python %s: %s",
+                    self.embeddings_model_name,
+                    sys.version.split()[0],
+                    e,
+                )
+                # Compatibility fallback for Python 3.12: use raw transformers + torch
+                try:
+                    fallback_model = TransformerMeanPoolingEmbedder(self.embeddings_model_name)
+                    self.embeddings_model = CachedEmbeddingModel(fallback_model)
+                    logger.info(
+                        "Loaded fallback embeddings backend (transformers+torch): %s",
+                        self.embeddings_model_name,
+                    )
+                except Exception as e2:
+                    logger.warning(
+                        "Fallback transformers embedding load failed for %s: %s",
+                        self.embeddings_model_name,
+                        e2,
+                    )
         
         # Try to import sinling for Sinhala NLP
         try:
@@ -81,28 +207,71 @@ class SinhalaNLPEngine:
         self.sequence_markers = ['අදියර', 'පියවර', 'අවස්ථා']
         self.importance_markers = ['වැදගත්', 'අත්‍යවශ්‍ය', 'අතිශය වැදගත්']
         
-        # Comprehensive Sinhala stop words (helping words that should not appear in nodes)
+        # ENHANCED Sinhala stop words (helping words that should not appear in nodes)
+        # Expanded from 114 to 180+ terms for better filtering
         self.stop_words = set([
             # Pronouns
             'මම', 'ඔබ', 'ඔහු', 'ඇය', 'අපි', 'ඔවුන්', 'මා', 'අප', 'ඔබට', 'මට',
+            'ඔහුට', 'ඇයට', 'අපට', 'ඔවුන්ට', 'මගේ', 'ඔබේ', 'ඔහුගේ', 'ඇයගේ',
+            'අපගේ', 'ඔවුන්ගේ', 'මාගේ', 'තමා', 'තමන්', 'තමන්ගේ',
+            
             # Articles and determiners
             'එක්', 'එක', 'මේ', 'මෙම', 'ඒ', 'ඔය', 'ඕ', 'කිසිවක්', 'සියලු', 'සියළු',
-            # Common helping verbs
+            'අනෙක්', 'තවත්', 'තව', 'හැම', 'හැමඳා', 'එම', 'මෙසේ', 'එලෙස',
+            'අනෙක', 'මෙලෙස', 'ඒ පරිදි', 'මෙ පරිදි', 'ඒ ආකාරයට',
+            
+            # Common helping verbs (EXPANDED)
             'වන', 'වන්නේ', 'වේ', 'වී', 'වෙයි', 'වුණා', 'වෙන්නේ', 'ඇති', 'ඇත', 'ඇත්තේ',
-            # Postpositions
+            'වෙන', 'වූ', 'වු', 'වුණු', 'වෙච්', 'වෙලා', 'වෙන්න', 'වෙන්නේ', 'වෙන්නෙ',
+            'වෙච්ච', 'වෙද්දී', 'වෙද්දි', 'වෙනකොට', 'වෙනව', 'වෙනවා',
+            'හැක', 'හැකි', 'හැකිය', 'හැකියි', 'හැකියාව', 'පුළුවන්', 'පුළුවන',
+            'අවශ්‍ය', 'තිබේ', 'තිබෙන', 'තිබුණ', 'තිබුණා', 'තිබෙන්නේ',
+            'ඇත', 'නැත', 'නැති', 'නැතිව', 'නැතුව',
+            
+            # Postpositions (EXPANDED)
             'සඳහා', 'විසින්', 'ගැන', 'පිළිබඳව', 'අතර', 'තුළ', 'හි', 'සමග', 'සමඟ', 'සිට', 'දක්වා', 'මගින්',
-            # Conjunctions
+            'වෙත', 'පැත්තේ', 'පැත්තෙන්', 'කරා', 'දී', 'දීම', 'බවට', 'වශයෙන්',
+            'අනුව', 'අනුකූලව', 'අනුසාරව', 'අනුගතව', 'අනුකූලව', 'අනුරූප',
+            'මූලික', 'මත', 'මතින්', 'ආශ්‍රිතව', 'පාදක', 'පදනම්',
+            
+            # Conjunctions (EXPANDED)
             'සහ', 'හා', 'මෙන්ම', 'ද', 'වගේම', 'පමණක්', 'නමුත්', 'කෙසේ', 'හෝ',
-            # Auxiliary words
+            'වුවද', 'වුවත්', 'මෙන්', 'සේ', 'වන්', 'හෝ', 'හෝද', 'නොහොත්',
+            'එනමුත්', 'එහෙත්', 'එහෙත', 'එවිට', 'එවිටදී', 'එවිට', 'එකින්',
+            'එහෙත්', 'ඉන්පසු', 'ඉන්', 'පසු', 'පසුව', 'පසුකාලීනව',
+            
+            # Auxiliary words (EXPANDED)
             'ඉතා', 'වඩා', 'මෙන්', 'තරම්', 'පමණ', 'ලෙස', 'ලෙසින්', 'යනාදී', 'ආදිය',
+            'විශේෂයෙන්', 'විශේෂයෙන්ම', 'මූලික', 'මූලිකව', 'ප්‍රධාන',
+            'ප්‍රධාන', 'මෙම', 'මෙසේ', 'එලෙස', 'මේ', 'එය', 'එ', 'ඒ',
+            'ඉතාමත්', 'ඉතාමත්ම', 'අතිශයින්', 'අතිශයින්ම',
+            
             # Common particles
-            'ද', 'ය', 'ක්', 'යි', 'නේ', 'නේද', 'ඩ', 'නම්',
-            # Question particles
+            'ද', 'ය', 'ක්', 'යි', 'නේ', 'නේද', 'ඩ', 'නම්', 'වනම්', 'නම',
+            'ඳ', 'ක', 'ද', 'යි', 'නෙ', 'වෙයි', 'වෙයිද', 'නෙද',
+            
+            # Question particles (EXPANDED)
             'කවර', 'කොහොමද', 'කුමක්', 'ඇයි', 'මොකද', 'කවදා', 'කොතැනද', 'කොහෙද',
-            # Modal particles  
-            'බව', 'නිසා', 'නම්', 'යැයි', 'කියා',
-            # Short common words
-            'ට', 'ටත්', 'යන', 'දී', 'ගේ', 'වල', 'ය', 'යි'
+            'කවරේ', 'කවර', 'කවරද', 'කවරදැයි', 'කවදාද', 'කොහෙන්', 'කොහෙද',
+            'කෙසේ', 'කෙසේද', 'කෙසේදැයි', 'මොනවා', 'මොනවද', 'මොන', 'මොකක්',
+            
+            # Modal particles (EXPANDED)
+            'බව', 'නිසා', 'නම්', 'යැයි', 'කියා', 'කියලා', 'කියන', 'කී',
+            'දැයි', 'දයි', 'යයි', 'යි', 'වෙයි', 'යැයිද', 'දැයිද',
+            
+            # Short common words (EXPANDED)
+            'ට', 'ටත්', 'යන', 'දී', 'ගේ', 'වල', 'ය', 'යි', 'ගෙන්', 'කර',
+            'වන', 'තුළ', 'හා', 'සහ', 'සහිත', 'සහිතව', 'සමග', 'සමඟ',
+            
+            # Temporal/Aspect markers
+            'විට', 'වී', 'වූ', 'වන', 'වෙමින්', 'වෙමින', 'ලද', 'ලබන', 'ලබා',
+            'තිබෙන', 'තිබූ', 'තිබෙමින්', 'තිබෙමින', 'පවතින', 'පවතින්නා',
+            
+            # Numbers and quantifiers (that are not concepts)
+            'එක', 'දෙක', 'තුන', 'හතර', 'පස', 'හය', 'හත', 'අට', 'නමය',
+            'දහය', 'සියය', 'දහස', 'ලක්ෂය', 'මිලියනය',
+            'බොහෝ', 'සෑම', 'සෑම', 'සෑමක්', 'සෑමක', 'සියලු', 'සියලුම',
+            'සියල්ල', 'සියල්', 'ඇතැම්', 'ඇතැම', 'ඇතැමක්', 'කිහිපයක්',
         ])
 
         # Hybrid node extractor (rule patterns + embeddings + re-ranker)
@@ -271,24 +440,22 @@ class SinhalaNLPEngine:
             Similarity score between 0 and 1
         """
         if not self.embeddings_model:
-            # Fallback to lexical and character n-gram similarity
-            return max(
-                self._word_overlap_similarity(text1, text2),
-                self._char_ngram_similarity(text1, text2)
-            )
+            return self._fallback_semantic_similarity(text1, text2)
         
         try:
-            embeddings = self.embeddings_model.encode([text1, text2])
+            embeddings = self.embeddings_model.encode(
+                [text1, text2],
+                convert_to_numpy=True,
+                show_progress_bar=False,
+                batch_size=32,
+            )
             similarity = np.dot(embeddings[0], embeddings[1]) / (
                 np.linalg.norm(embeddings[0]) * np.linalg.norm(embeddings[1])
             )
             return float(similarity)
         except Exception as e:
             logger.warning(f"Error computing similarity: {e}")
-            return max(
-                self._word_overlap_similarity(text1, text2),
-                self._char_ngram_similarity(text1, text2)
-            )
+            return self._fallback_semantic_similarity(text1, text2)
     
     def cluster_concepts(self, entities: List[Dict], threshold: float = 0.6) -> List[List[Dict]]:
         """
@@ -301,13 +468,18 @@ class SinhalaNLPEngine:
             return []
         
         if not self.embeddings_model:
-            # Simple clustering based on word patterns
-            return self._simple_cluster(entities)
+            # Better fallback: TF-IDF + LSA semantic clustering
+            return self._tfidf_lsa_cluster(entities, threshold=max(0.35, threshold - 0.1))
         
         try:
             # Extract texts for embedding
             texts = [e['text'] for e in entities]
-            embeddings = self.embeddings_model.encode(texts)
+            embeddings = self.embeddings_model.encode(
+                texts,
+                convert_to_numpy=True,
+                show_progress_bar=False,
+                batch_size=64,
+            )
 
             threshold = self._adaptive_cluster_threshold(embeddings, threshold)
             
@@ -627,6 +799,30 @@ class SinhalaNLPEngine:
         
         return intersection / union if union > 0 else 0.0
 
+    def _synonym_overlap_similarity(self, text1: str, text2: str) -> float:
+        """Compute overlap after expanding tokens via Sinhala synonym sets."""
+        tokens1 = {self._normalize_term(t) for t in self._tokenize(text1)}
+        tokens2 = {self._normalize_term(t) for t in self._tokenize(text2)}
+        tokens1 = {t for t in tokens1 if t}
+        tokens2 = {t for t in tokens2 if t}
+
+        if not tokens1 or not tokens2:
+            return 0.0
+
+        def expand(tokens: Set[str]) -> Set[str]:
+            expanded = set(tokens)
+            for token in tokens:
+                for syn in self.sinhala_synonyms.get(token, set()):
+                    expanded.add(self._normalize_term(syn))
+            return {t for t in expanded if t}
+
+        expanded1 = expand(tokens1)
+        expanded2 = expand(tokens2)
+        union = len(expanded1 | expanded2)
+        if union == 0:
+            return 0.0
+        return len(expanded1 & expanded2) / union
+
     def _char_ngram_similarity(self, text1: str, text2: str, n: int = 3) -> float:
         """Character n-gram similarity for short Sinhala terms."""
         t1 = self._normalize_term(text1)
@@ -643,6 +839,154 @@ class SinhalaNLPEngine:
         intersection = len(grams1 & grams2)
         union = len(grams1 | grams2)
         return intersection / union if union else 0.0
+
+    def _fallback_semantic_similarity(self, text1: str, text2: str) -> float:
+        """Weighted fallback similarity: synonym overlap + TF-IDF/LSA + lexical + n-gram."""
+        synonym_sim = self._synonym_overlap_similarity(text1, text2)
+        lexical_sim = self._word_overlap_similarity(text1, text2)
+        char_sim = self._char_ngram_similarity(text1, text2)
+        lsa_sim = self._tfidf_lsa_pair_similarity(text1, text2)
+        score = (0.35 * synonym_sim) + (0.35 * lsa_sim) + (0.2 * lexical_sim) + (0.1 * char_sim)
+        return float(max(0.0, min(1.0, score)))
+
+    def _tfidf_lsa_pair_similarity(self, text1: str, text2: str) -> float:
+        """Compute pair similarity using lightweight TF-IDF + truncated SVD (LSA)."""
+        docs = [text1 or "", text2 or ""]
+        matrix, _ = self._build_tfidf_matrix(docs)
+        if matrix.shape[1] == 0:
+            return max(self._word_overlap_similarity(text1, text2), self._char_ngram_similarity(text1, text2))
+
+        # LSA projection with small rank for stability on tiny corpora
+        rank = min(2, matrix.shape[0], matrix.shape[1])
+        if rank >= 1:
+            try:
+                u, s, vt = np.linalg.svd(matrix, full_matrices=False)
+                lsa = u[:, :rank] * s[:rank]
+                a, b = lsa[0], lsa[1]
+                denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8
+                return float(np.dot(a, b) / denom)
+            except Exception:
+                pass
+
+        a, b = matrix[0], matrix[1]
+        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8
+        return float(np.dot(a, b) / denom)
+
+    def _build_tfidf_matrix(self, docs: List[str]) -> Tuple[np.ndarray, List[str]]:
+        """Build a lightweight TF-IDF matrix without external dependencies."""
+        tokenized_docs: List[List[str]] = []
+        df_counter: Counter = Counter()
+
+        for doc in docs:
+            tokens = [self._normalize_term(t) for t in self._tokenize(doc)]
+            tokens = [t for t in tokens if t and t not in self.stop_words and len(t) >= 2]
+            tokenized_docs.append(tokens)
+            for token in set(tokens):
+                df_counter[token] += 1
+
+        vocab = sorted(df_counter.keys())
+        if not vocab:
+            return np.zeros((len(docs), 0), dtype=np.float32), []
+
+        token_to_idx = {t: i for i, t in enumerate(vocab)}
+        matrix = np.zeros((len(docs), len(vocab)), dtype=np.float32)
+        num_docs = max(1, len(docs))
+
+        for doc_idx, tokens in enumerate(tokenized_docs):
+            if not tokens:
+                continue
+            tf_counter = Counter(tokens)
+            total = len(tokens)
+            for token, tf in tf_counter.items():
+                col = token_to_idx[token]
+                tf_val = tf / total
+                idf = math.log((1 + num_docs) / (1 + df_counter[token])) + 1.0
+                matrix[doc_idx, col] = tf_val * idf
+
+        return matrix, vocab
+
+    def _tfidf_lsa_cluster(self, entities: List[Dict], threshold: float = 0.5) -> List[List[Dict]]:
+        """Fallback clustering using TF-IDF + LSA similarity matrix."""
+        if not entities:
+            return []
+
+        texts = [e.get('text', '') for e in entities]
+        tfidf, _ = self._build_tfidf_matrix(texts)
+        if tfidf.shape[1] == 0:
+            return self._simple_cluster(entities)
+
+        rank = min(16, tfidf.shape[0], tfidf.shape[1])
+        if rank >= 2:
+            try:
+                u, s, vt = np.linalg.svd(tfidf, full_matrices=False)
+                vectors = u[:, :rank] * s[:rank]
+            except Exception:
+                vectors = tfidf
+        else:
+            vectors = tfidf
+
+        clusters: List[List[Dict]] = []
+        used: Set[int] = set()
+
+        for i, entity in enumerate(entities):
+            if i in used:
+                continue
+            cluster = [entity]
+            used.add(i)
+            for j in range(i + 1, len(entities)):
+                if j in used:
+                    continue
+                a = vectors[i]
+                b = vectors[j]
+                sim = float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8))
+                syn_sim = self._synonym_overlap_similarity(texts[i], texts[j])
+                mixed = 0.75 * sim + 0.25 * syn_sim
+                if mixed >= threshold:
+                    cluster.append(entities[j])
+                    used.add(j)
+            clusters.append(cluster)
+
+        return clusters
+
+    def _load_sinhala_synonyms(self) -> Dict[str, Set[str]]:
+        """Load Sinhala synonym mapping (WordNet-style) from env JSON path or defaults."""
+        synonym_map: Dict[str, Set[str]] = {
+            'ගුරු': {'ආචාර්ය', 'ශික්ෂක'},
+            'ශිෂ්‍ය': {'සිසුවා', 'දරුවා'},
+            'අධ්‍යාපනය': {'ඉගෙනීම', 'ශික්ෂණය'},
+            'සෞඛ්‍යය': {'ආරෝග්‍යය', 'නිරෝගීභාවය'},
+            'රෝගය': {'ලෙඩ', 'අසනීපය'},
+            'හේතුව': {'කාරණය', 'මූලය'},
+            'ප්‍රතිඵලය': {'ප්‍රතිඵල', 'ඵලය'},
+            'සමාජය': {'සමාජ', 'ප්‍රජාව'},
+            'පරිසරය': {'වාතාවරණය', 'පරිසර'},
+            'දැනුම': {'ඥානය', 'විද්‍යාව'},
+        }
+
+        custom_path = os.getenv('SINHALA_WORDNET_PATH', '').strip()
+        if not custom_path:
+            return synonym_map
+
+        try:
+            import json
+            with open(custom_path, encoding='utf-8') as fp:
+                payload = json.load(fp)
+            if isinstance(payload, dict):
+                for key, values in payload.items():
+                    if not isinstance(values, list):
+                        continue
+                    key_norm = self._normalize_term(str(key))
+                    if not key_norm:
+                        continue
+                    syns = {self._normalize_term(str(v)) for v in values}
+                    syns = {s for s in syns if s}
+                    if key_norm not in synonym_map:
+                        synonym_map[key_norm] = set()
+                    synonym_map[key_norm].update(syns)
+        except Exception as e:
+            logger.warning("Failed to load Sinhala WordNet synonyms from %s: %s", custom_path, e)
+
+        return synonym_map
     
     def clean_label(self, text: str) -> str:
         """Remove stop words from text to show only concepts."""

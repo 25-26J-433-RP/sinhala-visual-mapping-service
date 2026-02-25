@@ -78,26 +78,64 @@ _TYPE_PROTOTYPES: Dict[str, List[str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Lexical marker lists (mirrors nlp_engine but scoped here for independence)
+# ENHANCED Lexical marker lists (EXPANDED from ~30 to ~90 markers)
+# Includes student essay patterns for better classification accuracy
 # ---------------------------------------------------------------------------
 _MARKERS: Dict[str, List[str]] = {
+    # IS-A markers: 9 → 30 markers (definitional, taxonomic, classification)
     REL_IS_A: [
+        # Basic definitional markers
         "යනු", "හෙවත්", "කියන", "අර්ථය", "අර්ථයෙන්",
         "හැඳින්වෙයි", "ලෙස", "ලෙසින්",
-        "උදාහරණ", "උදාහරණයක්", "උදා:",
+        # Essay-style definitions
+        "නිර්වචනය කළ හැක්කේ", "අර්ථ දක්වන්නේ", "හඳුන්වන්නේ",
+        "ගණ්‍ය කරයි", "ශ්‍රේණිගත කරයි", "වර්ගය", "ප්‍රභේදය",
+        # Exemplification (is-a through examples)
+        "උදාහරණ", "උදාහරණයක්", "උදා:", "උදාහරණයක් ලෙස",
+        "එනම්", "එබැවින්", "මෙහිදී", "මෙසේ",
+        # Academic classification
+        "ලෙස හඳුන්වන", "ලෙස නිර්වචනය කෙරේ", "ලෙස සැලකේ",
+        "වේ", "වන", "වූ", "වන්නේ",
     ],
+    
+    # PART-OF markers: 8 → 20 markers (compositional, membership, inclusion)
     REL_PART_OF: [
+        # Basic part/whole markers
         "අංශය", "කොටස", "අයත්", "අංග", "අභ්‍යන්තර",
         "භාගය", "ශාඛාව", "කොටසකි",
+        # Extended compositional markers
+        "කොටසක් වේ", "අයිති", "ඇතුළත්", "අඩංගු",
+        "සමන්විත", "සමුදායේ", "කොටසක්", "දෙකොටස",
+        # Membership and inclusion
+        "අයිති වේ", "අයත් වේ", "තුළ පවතී", "ඇතුළත් වේ",
     ],
+    
+    # CAUSE-EFFECT markers: 9 → 25 markers (causal, functional, consequential)
     REL_CAUSE: [
+        # Basic causal markers
         "නිසා", "හේතුවෙන්", "ප්‍රතිඵලයෙන්",
         "ප්‍රතිඵලයක් ලෙස", "ඒ හේතුවෙන්",
+        # Action and causation
         "කරන", "ඇති කරයි", "සිදු කරයි",
+        "ජනනය කරයි", "ඇතිවේ", "හේතුවක් වේ",
+        # Essay-style causation
+        "මේ හේතුව නිසා", "එම නිසා", "ඉන් ප්‍රතිඵලයක් ලෙස",
+        "ප්‍රේරණය කරයි", "වටා ගැනීමට හේතුව", "බලපායි",
+        # Consequence and result
+        "ප්‍රතිඵලය", "ප්‍රතිඵලයන්", "ප්‍රතිඵල", "හේතුව",
+        "ප්‍රතිඵලයක්", "හේතු", "හේතූන්", "බලපෑම",
+        # Reason and explanation
+        "හේතුවට", "හේතුවෙන් වශයෙන්", "හේතුවෙන්ම",
     ],
+    
+    # RELATED-TO markers: 8 → 15 markers (association, conjunction, proximity)
     REL_RELATED: [
+        # Basic association markers
         "සහ", "හා", "මෙන්ම", "සමඟ", "ද", "සම්බන්ධ",
         "ආශ්‍රිත", "ආශ්‍රිතය",
+        # Extended association
+        "සම්බන්ධව", "සම්බන්ධයෙන්", "සමාන", "සමානව",
+        "සමකාලීන", "එකට", "එක්ව",
     ],
 }
 
@@ -106,6 +144,7 @@ _MARKERS: Dict[str, List[str]] = {
 # ---------------------------------------------------------------------------
 
 # Postpositions / particles that reveal the role of the word that PRECEDES them.
+# ENHANCED: Expanded from 23 to 60+ entries for better syntactic directionality
 # Format:  token → role assigned to the preceding entity
 #   'cause_src'   – preceding entity is the CAUSE   (source in cause-effect)
 #   'cause_tgt'   – preceding entity is the EFFECT  (target in cause-effect)
@@ -114,46 +153,108 @@ _MARKERS: Dict[str, List[str]] = {
 #   'part_whole'  – preceding entity is the WHOLE   (target in part-of)
 #   'agent'       – preceding entity is the AGENT   (source, any relation)
 _POST_ROLE: Dict[str, str] = {
-    # causal cues (cause precedes cue)
-    'නිසා':          'cause_src',
-    'හේතුවෙන්':      'cause_src',
-    'ප්‍රතිඵලයෙන්':   'cause_src',
-    'ඒ හේතුවෙන්':    'cause_src',
-    'මගින්':         'cause_src',
-    # agent marker
-    'විසින්':        'agent',
-    # definitional (child precedes cue)
-    'යනු':          'isa_child',
-    'හෙවත්':        'isa_child',
-    'ලෙස':          'isa_child',
-    'ලෙසින්':       'isa_child',
-    'ලෙස හඳුන්වේ':  'isa_child',
-    'ලෙස නිර්වචනය': 'isa_child',
-    # genitive → preceding word is the WHOLE (target of part-of)
-    'ගේ':           'part_whole',
-    'හි':           'part_whole',
-    'ල':            'part_whole',
-    'වල':           'part_whole',
-    # part markers → preceding word is the PART (source of part-of)
-    'කොටසකි':       'part_part',
-    'කොටසක්':      'part_part',
-    'කොටස':        'part_part',
-    'අංශය':        'part_part',
-    'ශාඛාව':        'part_part',
-    'අයිතිය':       'part_part',
+    # ── Causal cues (cause precedes cue) ──────────────────────────────────
+    'නිසා':                 'cause_src',
+    'හේතුවෙන්':             'cause_src',
+    'ප්‍රතිඵලයෙන්':          'cause_src',
+    'ඒ හේතුවෙන්':           'cause_src',
+    'මගින්':                'cause_src',
+    'හේතුවට':              'cause_src',
+    'හේතුවෙන් වශයෙන්':      'cause_src',
+    'නිසා වශයෙන්':          'cause_src',
+    'බව නිසා':             'cause_src',
+    'මුල්':                 'cause_src',
+    'සලකා':                'cause_src',
+    
+    # ── Effect/result markers (preceding entity receives effect) ───────────
+    'ලැබේ':                'cause_tgt',
+    'වේ':                   'cause_tgt',
+    'ඇතිවේ':               'cause_tgt',
+    'සිදු වේ':              'cause_tgt',
+    'ඇති වූ':               'cause_tgt',
+    'සිදුවූ':               'cause_tgt',
+    
+    # ── Agent markers ──────────────────────────────────────────────────────
+    'විසින්':               'agent',
+    'විසින් කරන ලද':        'agent',
+    'මගින්':                'agent',
+    'තුළින්':               'agent',
+    'හරහා':                'agent',
+    
+    # ── Definitional markers (child precedes cue) ──────────────────────────
+    'යනු':                 'isa_child',
+    'හෙවත්':               'isa_child',
+    'ලෙස':                 'isa_child',
+    'ලෙසින්':              'isa_child',
+    'ලෙස හඳුන්වේ':         'isa_child',
+    'ලෙස නිර්වචනය':        'isa_child',
+    'ලෙස අර්ථ දක්වයි':     'isa_child',
+    'ලෙස හඳුන්වන්නේ':      'isa_child',
+    'ලෙස සැලකේ':           'isa_child',
+    'වශයෙන්':              'isa_child',
+    'වේ':                  'isa_child',
+    'වන':                  'isa_child',
+    'විට':                 'isa_child',
+    
+    # ── Genitive (preceding word is the WHOLE - target of part-of) ─────────
+    'ගේ':                  'part_whole',
+    'හි':                  'part_whole',
+    'ල':                   'part_whole',
+    'වල':                  'part_whole',
+    'තුළ':                 'part_whole',
+    'තුළ ඇති':             'part_whole',
+    'අතර':                'part_whole',
+    'අතරින්':              'part_whole',
+    'සියල්ලෙහි':           'part_whole',
+    'ඇතුලු':               'part_whole',
+    'අන්තර්ගත':           'part_whole',
+    
+    # ── Part markers (preceding word is the PART - source of part-of) ──────
+    'කොටසකි':              'part_part',
+    'කොටසක්':             'part_part',
+    'කොටස':               'part_part',
+    'අංශය':               'part_part',
+    'ශාඛාව':               'part_part',
+    'අයිතිය':              'part_part',
+    'අයත්':               'part_part',
+    'අයත් වන':            'part_part',
+    'අඩංගු':              'part_part',
+    'ඇතුළත්':             'part_part',
+    'භාගය':               'part_part',
+    'දෙකොටස':             'part_part',
+    'අංගයකි':             'part_part',
+    'අපේක්ෂා':            'part_part',
 }
 
+# ENHANCED Verb/predicate patterns for better directionality resolution
 # Verb/predicate patterns that, when they appear AFTER an entity, signal
 # that the entity just BEFORE the verb is the EFFECT / product (target).
 _EFFECT_VERBS: List[str] = [
+    # Result verbs (entity receives the action/effect)
     'ඇතිවේ', 'ජනනය', 'නිෂ්පාදනය', 'ඇති කරයි', 'සිදු කරයි',
     'ලබා දෙයි', 'ලබා ගනී', 'කෙරේ', 'වේ', 'ඇති', 'ශාකය',
+    # Extended result/state verbs
+    'ලැබේ', 'ලැබුණි', 'සිදු වේ', 'සිදුවේ', 'සිදු වූ', 'සිදුවූ',
+    'ඇතිවූ', 'ඇති වූ', 'ඇති වන', 'ඇතිවන', 'නිර්මාණය',
+    'හටගනී', 'හටගත්', 'පැන නගී', 'බිහිවේ', 'විකසිත',
+    # Essay-specific result verbs
+    'දියුණු වේ', 'වර්ධනය වේ', 'වර්ධනය', 'පැවතුනි',
+    'පැවතී', 'ඇති කෙරේ', 'බිහි කරයි', 'ජනිත',
 ]
 
 # If an entity precedes one of these verbs, it is the AGENT/CAUSE (source).
 _AGENT_VERBS: List[str] = [
+    # Causative/transitive verbs (entity performs the action)
     'නිෂ්පාදනය කරයි', 'ජනනය කරයි', 'ඇති කරයි', 'ලබා දෙයි',
     'ඉදිරිපත් කරයි', 'නිපදවයි', 'ඇතිකරයි',
+    # Extended causative verbs
+    'ඇති කරන', 'සිදු කරන', 'සිදු කරයි', 'නිර්මාණය කරයි',
+    'නිර්මාණය කරන', 'බලපායි', 'බලපාන', 'බලපෑම් කරයි',
+    'ප්‍රේරණය කරයි', 'හේතු වෙයි', 'හේතු වන', 'හේතුකොට',
+    # Essay-specific causative verbs
+    'දියුණු කරයි', 'වර්ධනය කරයි', 'පෝෂණය කරයි',
+    'සාර්ථක කරයි', 'ශක්තිමත් කරයි', 'වැඩිදියුණු කරයි',
+    'මෙහෙයවයි', 'මඟ පෙන්වයි', 'යොමු කරයි',
 ]
 
 
@@ -432,6 +533,73 @@ class RelationClassifier:
         self.engine = nlp_engine
         self._proto_embs: Optional[Dict[str, np.ndarray]] = None
         self._init_prototype_embeddings()
+        # Base thresholds (will be adjusted adaptively)
+        self._base_thresholds = {
+            REL_IS_A: 0.42,
+            REL_PART_OF: 0.48,
+            REL_CAUSE: 0.45,
+            REL_RELATED: 0.38,
+        }
+
+    def _calculate_adaptive_thresholds(
+        self,
+        text: str,
+        entities: List[Dict[str, Any]]
+    ) -> Dict[str, float]:
+        """
+        Calculate adaptive confidence thresholds based on text characteristics.
+        
+        Adjusts thresholds lower for:
+        - Longer, more complex essays (more context = more reliable)
+        - Higher entity density (more concepts = clearer relationships)
+        - Higher average entity confidence (better extraction quality)
+        
+        Adjusts thresholds higher for:
+        - Short, simple texts (less context = less reliable)
+        - Low entity density (sparse concepts)
+        - Lower entity confidence (noisy extraction)
+        
+        Returns
+        -------
+        Dict[str, float]
+            Per-type adjusted thresholds
+        """
+        # Text complexity metrics
+        text_length = len(text)
+        num_entities = len(entities)
+        num_sentences = len(self.engine._split_sentences_with_spans(text))
+        
+        # Entity quality metrics
+        avg_entity_confidence = sum(e.get("confidence", 0.5) for e in entities) / max(num_entities, 1)
+        entity_density = num_entities / max(num_sentences, 1)  # entities per sentence
+        
+        # Normalization factors
+        length_factor = min(1.0, text_length / 800)  # normalize to ~800 chars (typical essay paragraph)
+        density_factor = min(1.0, entity_density / 4.0)  # normalize to 4 entities/sentence
+        quality_factor = avg_entity_confidence  # already in [0,1]
+        
+        # Combined adjustment factor: higher = lower threshold (more permissive)
+        # Formula: avg of three factors, weighted towards quality
+        adjustment = (0.3 * length_factor + 0.3 * density_factor + 0.4 * quality_factor)
+        
+        # Apply adjustment to base thresholds
+        # Adjustment range: -0.08 to +0.08 from base
+        # Higher adjustment = lower threshold (subtract more)
+        adaptive_thresholds = {}
+        for rel_type, base in self._base_thresholds.items():
+            # Adjust: reduce threshold when adjustment is high (good quality text)
+            # Increase threshold when adjustment is low (poor quality text)
+            adjusted = base - (adjustment - 0.5) * 0.16  # 0.16 = 2 * max_adjustment
+            # Clamp to reasonable bounds
+            adaptive_thresholds[rel_type] = max(0.25, min(0.65, adjusted))
+        
+        logger.debug(
+            f"Adaptive thresholds: length={text_length}, entities={num_entities}, "
+            f"density={entity_density:.2f}, quality={avg_entity_confidence:.2f}, "
+            f"adjustment={adjustment:.2f}, thresholds={adaptive_thresholds}"
+        )
+        
+        return adaptive_thresholds
 
     # =========================================================================
     # Public API
@@ -466,6 +634,9 @@ class RelationClassifier:
 
         sentences = self.engine._split_sentences_with_spans(text)
 
+        # ── Calculate adaptive thresholds based on text characteristics ───────
+        adaptive_thresholds = self._calculate_adaptive_thresholds(text, entities)
+
         # ── Stage 1: candidate pairs ──────────────────────────────────────────
         candidates = self._generate_candidates(entities, sentences, text)
 
@@ -475,7 +646,8 @@ class RelationClassifier:
             rel = self._classify_pair(pair, text)
             if rel is None:
                 continue
-            threshold = self.engine.rel_thresholds.get(rel["type"], 0.45)
+            # Use adaptive threshold instead of fixed threshold
+            threshold = adaptive_thresholds.get(rel["type"], 0.45)
             if rel["confidence"] < threshold:
                 continue
             # Use DIRECTED key: (source, target, type) — preserves orientation.
