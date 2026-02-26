@@ -338,8 +338,9 @@ class IntelligentMindMapGenerator:
         # correct orientation from the relation classifier is preserved.
         # When the reverse orientation of the same type was already seen
         # we keep whichever has the higher direction_score.
+        scored_relationships = self._rebalance_relationship_edges_for_scoring(relationships)
         edge_keys: Dict[tuple, Dict] = {}
-        for rel in relationships:
+        for rel in scored_relationships:
             source_id = node_map.get(rel['source'])
             target_id = node_map.get(rel['target'])
 
@@ -347,13 +348,22 @@ class IntelligentMindMapGenerator:
                 fwd_key = (source_id, target_id, rel['type'])
                 rev_key = (target_id, source_id, rel['type'])
                 new_dir = rel.get('direction_score', 0.5)
+                rel_conf = float(rel.get('confidence', 0.0))
+                is_semantic = rel.get('type') == 'related-to'
+                edge_score = rel_conf * (0.82 if is_semantic else 1.0)
+                edge_weight = max(1, int((edge_score if not is_semantic else edge_score * 0.9) * 3))
                 edge_dict = {
                     'id': self._generate_id(),
                     'source': source_id,
                     'target': target_id,
                     'type': rel['type'],
-                    'weight': max(1, int(rel['confidence'] * 3)),
-                    'confidence': rel['confidence'],
+                    'weight': edge_weight,
+                    'confidence': rel_conf,
+                    'edge_score': round(edge_score, 4),
+                    'relation_family': rel.get(
+                        'relation_family',
+                        'semantic_relatedness' if is_semantic else 'logical_relation'
+                    ),
                     'direction_score': new_dir,
                     'directed': rel.get('directed', False),
                 }
@@ -363,12 +373,43 @@ class IntelligentMindMapGenerator:
                         del edge_keys[rev_key]
                         edge_keys[fwd_key] = edge_dict
                 elif fwd_key not in edge_keys or \
-                        rel['confidence'] > edge_keys[fwd_key]['confidence']:
+                    edge_score > edge_keys[fwd_key].get('edge_score', edge_keys[fwd_key].get('confidence', 0.0)):
                     edge_keys[fwd_key] = edge_dict
 
         edges.extend(edge_keys.values())
         
         return nodes, edges
+
+    def _rebalance_relationship_edges_for_scoring(self, relationships: List[Dict]) -> List[Dict]:
+        """
+        Separate logical relations from semantic relatedness and cap soft
+        semantic edges so they do not dominate graph connectivity.
+        """
+        if not relationships:
+            return []
+
+        logical = sorted(
+            [r for r in relationships if r.get('type') != 'related-to'],
+            key=lambda r: float(r.get('confidence', 0.0)),
+            reverse=True,
+        )
+        semantic = sorted(
+            [r for r in relationships if r.get('type') == 'related-to'],
+            key=lambda r: float(r.get('confidence', 0.0)),
+            reverse=True,
+        )
+
+        if not semantic:
+            return logical
+
+        if not logical:
+            semantic_cap = min(len(semantic), 6)
+        else:
+            semantic_cap = min(len(semantic), len(logical) + 2)
+
+        selected = logical + semantic[:semantic_cap]
+        selected.sort(key=lambda r: float(r.get('confidence', 0.0)), reverse=True)
+        return selected
 
     def _apply_enumeration_structure(
         self,
