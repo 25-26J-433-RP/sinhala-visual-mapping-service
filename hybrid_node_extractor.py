@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 # Import morphology handler for inflection normalization
 try:
     from sinhala_morphology import get_morphology_handler, normalize_sinhala_word, split_compound_word
@@ -32,8 +34,6 @@ except ImportError:
     MORPHOLOGY_AVAILABLE = False
     def normalize_sinhala_word(word): return word
     def split_compound_word(word): return [word]
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Sinhala concept anchor vocabulary (EXPANDED)
@@ -435,6 +435,14 @@ class HybridNodeExtractor:
                 + self._W_FREQ * freq_score
                 + self._W_POS * pos_score
             )
+
+            # Context-sensitive disambiguation boost/penalty
+            context_score = self.engine.context_disambiguation_score(
+                c.get("text", ""),
+                c.get("context", ""),
+            )
+            # range ~[0.85, 1.15] so it nudges rather than dominates
+            confidence *= (0.85 + 0.30 * context_score)
 
             # Multi-word phrase bonus
             if " " in c["text"]:

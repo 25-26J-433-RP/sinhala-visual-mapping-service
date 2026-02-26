@@ -4,18 +4,21 @@ Uses lightweight models for intelligent node and relationship extraction.
 """
 
 import re
+import csv
 import hashlib
 import math
 import os
 import sys
 import unicodedata
-from typing import List, Dict, Tuple, Set, Any
+from pathlib import Path
+from typing import List, Dict, Tuple, Set, Any, Optional
 import numpy as np
 from collections import defaultdict, Counter
 import logging
 from config import Config
 from hybrid_node_extractor import HybridNodeExtractor
 from relation_classifier import RelationClassifier
+from sinhala_morphology import get_morphology_handler
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +135,9 @@ class SinhalaNLPEngine:
         self.embeddings_model_name = getattr(
             Config, 'EMBEDDINGS_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2'
         )
+
+        # Sinhala morphology / stemming / lemmatization support
+        self.morphology = get_morphology_handler()
         
         # Lightweight Sinhala synonym lexicon (WordNet-style fallback)
         self.sinhala_synonyms: Dict[str, Set[str]] = self._load_sinhala_synonyms()
@@ -195,6 +201,19 @@ class SinhalaNLPEngine:
         
         self.question_words = ['කවර', 'කොහොමද', 'කුමක්', 'ඇයි', 'මොකද', 'කවදා', 'කොතැනද']
 
+        # Context anchors for word-sense disambiguation in essays (base lexicon)
+        self.base_disambiguation_domains: Dict[str, Set[str]] = {
+            'education': {'පාසල්', 'ශිෂ්‍ය', 'ගුරු', 'ඉගෙනීම', 'විෂය', 'රචනය', 'විභාග'},
+            'science': {'විද්‍යාව', 'පර්යේෂණ', 'පරීක්ෂණ', 'සංකල්ප', 'රසායන', 'භෞතික'},
+            'society': {'සමාජය', 'ජනතාව', 'ප්‍රජාව', 'සංස්කෘතිය', 'සහභාගීත්වය'},
+            'environment': {'පරිසරය', 'වනය', 'ජලය', 'දේශගුණය', 'දූෂණය', 'සුරැකීම'},
+            'health': {'සෞඛ්‍යය', 'රෝගය', 'ප්‍රතිකාර', 'වෛද්‍ය', 'ආහාර', 'ව්‍යායාම'},
+        }
+        self.disambiguation_domains: Dict[str, Set[str]] = {
+            k: set(v) for k, v in self.base_disambiguation_domains.items()
+        }
+        self.ambiguous_term_domains: Dict[str, Dict[str, float]] = {}
+
         # Relationship markers for heuristic edge typing
         self.definition_markers = ['යනු', 'හෙවත්', 'කියන', 'අර්ථය', 'අර්ථයෙන්', 'හැඳින්වෙයි']
         self.cause_markers = ['නිසා', 'හේතුවෙන්', 'ප්‍රතිඵලයෙන්', 'ප්‍රතිඵලයක් ලෙස', 'ඒ හේතුවෙන්']
@@ -206,6 +225,11 @@ class SinhalaNLPEngine:
         self.list_split_pattern = re.compile(r'\s*,\s*|\s+සහ\s+|\s+හා\s+|\s+මෙන්ම\s+')
         self.sequence_markers = ['අදියර', 'පියවර', 'අවස්ථා']
         self.importance_markers = ['වැදගත්', 'අත්‍යවශ්‍ය', 'අතිශය වැදගත්']
+        self.comparison_markers = ['වඩා', 'සසඳා', 'සසඳන', 'vs', 'VS', 'වර්සස්', 'අතර වෙනස', 'සමානතා']
+        self.argument_markers = ['පළමුව', 'දෙවනුව', 'තෙවනුව', 'එක් පාර්ශවයෙන්', 'අනෙක් පාර්ශවයෙන්', 'නමුත්', 'එහෙත්', 'එයට ප්‍රතිවිරුද්ධව']
+        self.process_markers = ['පළමුව', 'ඊළඟට', 'පසුව', 'අවසානයේ', 'පියවර', 'ක්‍රියාවලිය', 'අදියර']
+        self.enumeration_lead_markers = ['ලෙස', 'වශයෙන්', 'ඇතුළුව', 'ආදිය', 'යනාදී', 'වැනි']
+        self.numbering_pattern = re.compile(r'(^|\s)(\d+[\)\.]|[a-zA-Z][\)\.]|[\u0D85-\u0DC6][\)\.])\s*')
         
         # ENHANCED Sinhala stop words (helping words that should not appear in nodes)
         # Expanded from 114 to 180+ terms for better filtering
@@ -273,6 +297,14 @@ class SinhalaNLPEngine:
             'බොහෝ', 'සෑම', 'සෑම', 'සෑමක්', 'සෑමක', 'සියලු', 'සියලුම',
             'සියල්ල', 'සියල්', 'ඇතැම්', 'ඇතැම', 'ඇතැමක්', 'කිහිපයක්',
         ])
+
+        # Tune domain anchors with actual essay corpus frequencies (requires stop_words)
+        self.disambiguation_domains = self._load_corpus_tuned_disambiguation_domains(
+            self.base_disambiguation_domains
+        )
+        self.ambiguous_term_domains = self._build_ambiguous_term_domains(
+            self.disambiguation_domains
+        )
 
         # Hybrid node extractor (rule patterns + embeddings + re-ranker)
         self.hybrid_extractor = HybridNodeExtractor(self)
@@ -566,51 +598,104 @@ class SinhalaNLPEngine:
         return filtered_phrases[:max_phrases]
 
     def extract_enumerations(self, text: str) -> List[Dict[str, Any]]:
-        """Extract enumerations like phases, examples, and required items."""
+        """Hybrid enumeration extractor with boundary scoring, comparison and nested list support."""
         enumerations: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, Tuple[str, ...], str]] = set()
         sentences = self._split_sentences_with_spans(text)
 
         for sentence, _ in sentences:
             if not sentence or len(sentence) < 10:
                 continue
 
-            # Phase/sequence enumeration
+            # 1) Comparison/contrast structures (X vs Y, X සහ Y අතර වෙනස)
+            comparison_enum = self._extract_comparison_structure(sentence)
+            has_comparison = comparison_enum is not None
+            if comparison_enum:
+                key = self._enumeration_signature(
+                    comparison_enum.get('head'), comparison_enum.get('items', []), comparison_enum.get('relation', '')
+                )
+                if key not in seen:
+                    seen.add(key)
+                    enumerations.append(comparison_enum)
+
+            # 2) Argument/discourse structures in student essays
+            argument_enum = self._extract_argument_structure(sentence)
+            if argument_enum:
+                key = self._enumeration_signature(
+                    argument_enum.get('head'), argument_enum.get('items', []), argument_enum.get('relation', '')
+                )
+                if key not in seen:
+                    seen.add(key)
+                    enumerations.append(argument_enum)
+
+            # 3) Explicit list markers and process-step enumerations
+            explicit_candidates = []
             if any(marker in sentence for marker in self.sequence_markers):
-                list_text = self._extract_list_after_marker(sentence, 'ලෙස') or self._extract_list_after_marker(sentence, 'වශයෙන්')
+                list_text = ''
+                for marker in self.enumeration_lead_markers:
+                    list_text = self._extract_list_after_marker(sentence, marker)
+                    if list_text:
+                        break
                 if not list_text:
                     list_text = sentence
-                items = self._extract_list_items(list_text)
-                if len(items) >= 2:
-                    head = self._infer_head_phrase(sentence, self.sequence_markers)
-                    enumerations.append({
-                        'head': head or 'අදියර',
-                        'items': items,
-                        'relation': 'sequence'
-                    })
+                explicit_candidates.append((
+                    self._infer_head_phrase(sentence, self.sequence_markers) or 'අදියර',
+                    list_text,
+                    'sequence'
+                ))
 
-            # Example enumeration with "වැනි" or explicit examples
             if 'වැනි' in sentence or any(marker in sentence for marker in self.example_markers):
                 before, after = sentence.split('වැනි', 1) if 'වැනි' in sentence else (sentence, '')
-                items = self._extract_list_items(before)
                 head = self._first_token(after) or self._infer_head_phrase(sentence, ['භාෂා', 'ක්‍රමවේද', 'මූලධර්ම'])
-                if len(items) >= 2:
-                    enumerations.append({
-                        'head': head,
-                        'items': items,
-                        'relation': 'example'
-                    })
+                explicit_candidates.append((head, before, 'example'))
 
-            # Importance/requirements enumeration
-            if any(marker in sentence for marker in self.importance_markers):
-                items = self._extract_list_items(sentence)
-                if len(items) >= 2:
-                    enumerations.append({
-                        'head': None,
-                        'items': items,
-                        'relation': 'requires'
-                    })
+            if any(marker in sentence for marker in self.importance_markers) and not has_comparison:
+                explicit_candidates.append((None, sentence, 'requires'))
 
-        return enumerations
+            # Nested enumerations like "X: a, b; Y: c, d"
+            if ':' in sentence and ('(' in sentence or ';' in sentence):
+                nested_list_text = sentence.split(':', 1)[1] if ':' in sentence else sentence
+                explicit_candidates.append((
+                    self._infer_head_phrase(sentence, ['වර්ග', 'වර්ගීකරණය', 'ප්‍රභේද', 'අංග']) or 'වර්ග',
+                    nested_list_text,
+                    'group'
+                ))
+
+            # Implicit lists (comma/connector heavy, process cues, numbered cues)
+            implicit_items, implicit_nested = self._extract_list_items_with_nested(sentence)
+            has_list_cues = any(sep in sentence for sep in [',', ';', ' සහ ', ' හා ', ' මෙන්ම '])
+            if has_list_cues and len(implicit_items) >= 3:
+                implicit_relation = 'sequence' if any(m in sentence for m in self.process_markers) else 'group'
+                implicit_head = self._infer_head_phrase(sentence, self.sequence_markers + ['වර්ග', 'අංග', 'අංශ', 'මූලධර්ම'])
+                explicit_candidates.append((implicit_head or None, sentence, implicit_relation))
+
+            for head, list_text, relation in explicit_candidates:
+                items, nested_map = self._extract_list_items_with_nested(list_text)
+                if len(items) < 2:
+                    continue
+                boundary_score = self._score_list_boundary(sentence, items, relation)
+                threshold = 0.5 if relation in {'comparison', 'argument'} else 0.56
+                if nested_map and relation == 'group':
+                    threshold = 0.45
+                if boundary_score < threshold:
+                    continue
+                key = self._enumeration_signature(head, items, relation)
+                if key in seen:
+                    continue
+                seen.add(key)
+                enum_payload = {
+                    'head': head,
+                    'items': items,
+                    'relation': relation,
+                    'confidence': round(boundary_score, 4),
+                }
+                if nested_map:
+                    enum_payload['nested_items'] = nested_map
+                elif relation in {'group', 'sequence'} and implicit_nested:
+                    enum_payload['nested_items'] = implicit_nested
+                enumerations.append(enum_payload)
+
+        return self._deduplicate_enumeration_candidates(enumerations)
     
     def _split_sentences(self, text: str) -> List[str]:
         """Split text into sentences (legacy helper)."""
@@ -618,7 +703,7 @@ class SinhalaNLPEngine:
 
     def _split_sentences_with_spans(self, text: str) -> List[Tuple[str, int]]:
         """Split text into sentences and return (sentence, start_index)."""
-        delimiters = ['.', '|', '?', '!', '।', ':', '\n']
+        delimiters = ['.', '|', '?', '!', '।', '\n']
         pattern = '|'.join(map(re.escape, delimiters))
         sentences = []
         start = 0
@@ -1015,15 +1100,35 @@ class SinhalaNLPEngine:
         """Tokenize text with Sinhala-aware pattern (sinling if available, else regex)."""
         if not text:
             return []
+        text = self._normalize_unicode(text)
         if self.sinling_tokenizer:
             try:
                 tokens = self.sinling_tokenizer.tokenize(text)
-                return [t for t in tokens if t and t.strip()]
+                base_tokens = [t for t in tokens if t and t.strip()]
+                return self._expand_sandhi_tokens(base_tokens)
             except Exception:
                 pass
         # Remove zero-width characters then extract Sinhala and Latin tokens
         text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)
-        return self.word_pattern.findall(text)
+        base_tokens = self.word_pattern.findall(text)
+        return self._expand_sandhi_tokens(base_tokens)
+
+    def _expand_sandhi_tokens(self, tokens: List[str]) -> List[str]:
+        """Expand likely compound/sandhi tokens into component roots (without losing original token)."""
+        expanded: List[str] = []
+        for token in tokens:
+            norm_token = self._normalize_term(token)
+            if not norm_token:
+                continue
+            expanded.append(norm_token)
+            if len(norm_token) >= 6:
+                parts = self.morphology.split_compound(norm_token)
+                if len(parts) > 1:
+                    for part in parts:
+                        part_norm = self._normalize_term(part)
+                        if part_norm and part_norm != norm_token:
+                            expanded.append(part_norm)
+        return expanded
 
     def _adaptive_cluster_threshold(self, embeddings: np.ndarray, base_threshold: float) -> float:
         """Adjust clustering threshold based on similarity distribution."""
@@ -1062,14 +1167,254 @@ class SinhalaNLPEngine:
         """Extract list items from a sentence-like fragment."""
         if not text:
             return []
-        cleaned = re.sub(r'[()\[\]{}"\'\u201c\u201d]', ' ', text)
-        candidates = [c.strip() for c in self.list_split_pattern.split(cleaned) if c.strip()]
+        candidates = self._split_list_candidates(text)
         items = []
         for cand in candidates:
+            cand = re.sub(r'[\[\]{}"\'\u201c\u201d]', ' ', cand)
+            cand = self.numbering_pattern.sub(' ', cand).strip()
             label = self.clean_label(cand)
-            if label and len(label) >= 2 and label not in items:
+            if label and len(label) >= 2 and len(label) <= 64 and label not in items:
                 items.append(label)
         return items
+
+    def _split_list_candidates(self, text: str) -> List[str]:
+        """Split candidate list items while preserving nested parenthesis spans."""
+        if not text:
+            return []
+        raw = self._normalize_unicode(text)
+        depth = 0
+        buff: List[str] = []
+        parts: List[str] = []
+        i = 0
+
+        while i < len(raw):
+            ch = raw[i]
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth = max(0, depth - 1)
+
+            if depth == 0:
+                matched_connector = None
+                for connector in [' සහ ', ' හා ', ' මෙන්ම ']:
+                    if raw.startswith(connector, i):
+                        matched_connector = connector
+                        break
+                if matched_connector:
+                    segment = ''.join(buff).strip()
+                    if segment:
+                        parts.append(segment)
+                    buff = []
+                    i += len(matched_connector)
+                    continue
+
+                if ch in [',', ';', '|', '/']:
+                    segment = ''.join(buff).strip()
+                    if segment:
+                        parts.append(segment)
+                    buff = []
+                    i += 1
+                    continue
+
+            buff.append(ch)
+            i += 1
+
+        tail = ''.join(buff).strip()
+        if tail:
+            parts.append(tail)
+        return parts
+
+    def _extract_list_items_with_nested(self, text: str) -> Tuple[List[str], Dict[str, List[str]]]:
+        """Extract list items and nested child lists (e.g., A: a1, a2)."""
+        if not text:
+            return [], {}
+
+        nested_map: Dict[str, List[str]] = {}
+        items: List[str] = []
+        candidates = self._split_list_candidates(text)
+        if not candidates:
+            return [], {}
+
+        for cand in candidates:
+            cand = self.numbering_pattern.sub(' ', cand).strip()
+            parent = cand
+            children: List[str] = []
+
+            if ':' in cand:
+                left, right = cand.split(':', 1)
+                parent = left.strip()
+                children = self._extract_list_items(right)
+            elif ' - ' in cand:
+                left, right = cand.split(' - ', 1)
+                parent = left.strip()
+                children = self._extract_list_items(right)
+            elif '(' in cand and ')' in cand:
+                left = cand.split('(', 1)[0].strip()
+                inner = cand.split('(', 1)[1].rsplit(')', 1)[0]
+                parent = left or cand
+                children = self._extract_list_items(inner)
+
+            parent_label = self.clean_label(parent)
+            if not parent_label or len(parent_label) < 2:
+                continue
+            if parent_label not in items:
+                items.append(parent_label)
+
+            clean_children = []
+            for child in children:
+                c = self.clean_label(child)
+                if c and c != parent_label and c not in clean_children:
+                    clean_children.append(c)
+            if clean_children:
+                nested_map[parent_label] = clean_children
+
+        return items, nested_map
+
+    def _deduplicate_enumeration_candidates(self, enumerations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Reduce overlaps across extraction paths and keep strongest candidate per item signature."""
+        if not enumerations:
+            return []
+
+        relation_priority = {
+            'comparison': 6,
+            'argument': 5,
+            'sequence': 4,
+            'requires': 3,
+            'example': 2,
+            'group': 1,
+        }
+        best_by_items: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+
+        for enum in enumerations:
+            items = [self._normalize_term(i) for i in enum.get('items', []) if i]
+            if len(items) < 2:
+                continue
+            key = tuple(items)
+            score = float(enum.get('confidence', 0.5))
+            score += 0.03 * relation_priority.get(enum.get('relation', ''), 0)
+            existing = best_by_items.get(key)
+            if not existing:
+                best_by_items[key] = dict(enum)
+                best_by_items[key]['_rank'] = score
+                continue
+
+            if score > float(existing.get('_rank', 0.0)):
+                repl = dict(enum)
+                repl['_rank'] = score
+                best_by_items[key] = repl
+
+        deduped = []
+        for enum in best_by_items.values():
+            enum.pop('_rank', None)
+            deduped.append(enum)
+        return deduped
+
+    def _enumeration_signature(self, head: Optional[str], items: List[str], relation: str) -> Tuple[str, Tuple[str, ...], str]:
+        """Canonical dedup signature for extracted enumerations."""
+        head_norm = self._normalize_term(head or '')
+        norm_items = tuple(self._normalize_term(i) for i in items if i)
+        return head_norm, norm_items, relation
+
+    def _score_list_boundary(self, sentence: str, items: List[str], relation: str) -> float:
+        """Feature-weighted boundary classifier (lightweight ML-style scoring)."""
+        if len(items) < 2:
+            return 0.0
+
+        marker_hits = sum(
+            1 for m in (self.sequence_markers + self.example_markers + self.importance_markers + self.enumeration_lead_markers)
+            if m in sentence
+        )
+        delimiter_hits = sentence.count(',') + sentence.count(';') + sentence.count(' සහ ') + sentence.count(' හා ') + sentence.count(' මෙන්ම ')
+        numbered = 1.0 if self.numbering_pattern.search(sentence) else 0.0
+        process_hit = 1.0 if any(m in sentence for m in self.process_markers) else 0.0
+        argument_hit = 1.0 if any(m in sentence for m in self.argument_markers) else 0.0
+        comparison_hit = 1.0 if any(m in sentence for m in self.comparison_markers) else 0.0
+
+        item_count = min(1.0, len(items) / 5.0)
+        delimiter_density = min(1.0, delimiter_hits / 4.0)
+        marker_strength = min(1.0, marker_hits / 3.0)
+        avg_len = sum(len(i) for i in items) / max(1, len(items))
+        len_score = min(1.0, max(0.0, (avg_len - 3.0) / 10.0))
+
+        relation_priors = {
+            'sequence': 0.25,
+            'example': 0.18,
+            'requires': 0.22,
+            'comparison': 0.30,
+            'argument': 0.28,
+            'group': 0.10,
+        }
+        prior = relation_priors.get(relation, 0.1)
+
+        raw = (
+            -1.15
+            + (1.35 * item_count)
+            + (0.70 * delimiter_density)
+            + (0.80 * marker_strength)
+            + (0.35 * len_score)
+            + (0.40 * numbered)
+            + (0.45 * process_hit)
+            + (0.40 * argument_hit)
+            + (0.45 * comparison_hit)
+            + prior
+        )
+        return float(1.0 / (1.0 + math.exp(-raw)))
+
+    def _extract_comparison_structure(self, sentence: str) -> Optional[Dict[str, Any]]:
+        """Detect comparison/contrast structures, e.g., X vs Y or X සහ Y අතර වෙනස."""
+        patterns = [
+            r'([^,.;!?]{2,60}?)\s+(?:vs\.?|VS|වර්සස්|වඩා|ට වඩා|සසඳා|සසඳන විට)\s+([^,.;!?]{2,60})',
+            r'([^,.;!?]{2,50}?)\s+සහ\s+([^,.;!?]{2,50}?)\s+අතර\s+(?:වෙනස|සමානතා|සසඳීම)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, sentence)
+            if not match:
+                continue
+            left = self.clean_label(self.numbering_pattern.sub(' ', match.group(1)).strip())
+            right = self.clean_label(self.numbering_pattern.sub(' ', match.group(2)).strip())
+            if left and right and left != right:
+                score = self._score_list_boundary(sentence, [left, right], 'comparison')
+                if score >= 0.5:
+                    return {
+                        'head': 'සසඳීම',
+                        'items': [left, right],
+                        'relation': 'comparison',
+                        'confidence': round(score, 4),
+                    }
+        return None
+
+    def _extract_argument_structure(self, sentence: str) -> Optional[Dict[str, Any]]:
+        """Detect argument-like discourse lists common in student essays."""
+        if not any(marker in sentence for marker in self.argument_markers):
+            return None
+
+        parts = [p.strip() for p in re.split(r'[;:]', sentence) if p.strip()]
+        if len(parts) < 2:
+            parts = [p.strip() for p in sentence.split('නමුත්') if p.strip()]
+
+        items: List[str] = []
+        for part in parts:
+            cleaned = self.numbering_pattern.sub(' ', part).strip()
+            tokens = [t for t in self._tokenize(cleaned) if t and t not in self.stop_words]
+            if len(tokens) < 2:
+                continue
+            claim = ' '.join(tokens[:5])
+            claim = self.clean_label(claim)
+            if claim and claim not in items:
+                items.append(claim)
+
+        if len(items) < 2:
+            return None
+
+        score = self._score_list_boundary(sentence, items, 'argument')
+        if score < 0.52:
+            return None
+        return {
+            'head': 'තර්ක',
+            'items': items,
+            'relation': 'argument',
+            'confidence': round(score, 4),
+        }
 
     def _infer_head_phrase(self, sentence: str, keywords: List[str]) -> str:
         """Infer a head concept phrase around a keyword."""
@@ -1105,14 +1450,219 @@ class SinhalaNLPEngine:
         text = self._normalize_unicode(text)
         cleaned = re.sub(r'[^A-Za-z0-9\u0D80-\u0DFF ]+', '', text)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip()
-        return cleaned
+
+        if not cleaned:
+            return ''
+
+        # Morphological normalization / lemmatization
+        tokens = cleaned.split()
+        normalized_tokens: List[str] = []
+        for token in tokens:
+            # citation form acts as a simple lemma
+            lemma = self.morphology.get_citation_form(token)
+            # fallback root normalization
+            root = self.morphology.normalize_word(lemma or token)
+            final = (root or lemma or token).strip()
+            if final:
+                normalized_tokens.append(final)
+
+        return ' '.join(normalized_tokens)
 
     def _normalize_unicode(self, text: str) -> str:
-        """Normalize Unicode to NFC to preserve Sinhala combining marks."""
+        """Normalize Unicode beyond NFC for Sinhala variant forms and hidden chars."""
         try:
-            return unicodedata.normalize('NFC', text)
+            # Keep Sinhala canonical composition (avoid aggressive compatibility fold)
+            norm = unicodedata.normalize('NFC', text)
+            # Remove hidden chars except ZWJ/ZWNJ which are meaningful in Indic scripts
+            norm = re.sub(r'[\u200B\uFEFF\u2060]', '', norm)
+            # Canonicalize punctuation variants commonly seen in OCR/user input
+            norm = (
+                norm.replace('–', '-')
+                .replace('—', '-')
+                .replace('‘', "'")
+                .replace('’', "'")
+                .replace('“', '"')
+                .replace('”', '"')
+                .replace('…', '...')
+            )
+            # Normalize whitespace classes
+            norm = re.sub(r'[\u00A0\u2000-\u200A\u202F\u205F\u3000]', ' ', norm)
+            norm = re.sub(r'\s+', ' ', norm).strip()
+            return unicodedata.normalize('NFC', norm)
         except Exception:
             return text
+
+    def context_disambiguation_score(self, term: str, context: str) -> float:
+        """
+        Context-sensitive entity disambiguation score in [0,1].
+        Higher means the term meaning aligns with surrounding sentence context.
+        """
+        if not term:
+            return 0.5
+
+        term_norm = self._normalize_term(term)
+        context_norm = self._normalize_unicode(context or '')
+        if not context_norm:
+            return 0.5
+
+        context_tokens = {self._normalize_term(t) for t in self._tokenize(context_norm)}
+        context_tokens = {t for t in context_tokens if t and t not in self.stop_words}
+
+        # Domain alignment score
+        domain_best = 0.0
+        domain_scores: Dict[str, float] = {}
+        for _, anchors in self.disambiguation_domains.items():
+            overlap = len(context_tokens & anchors)
+            if overlap:
+                score = min(1.0, overlap / max(2.0, len(anchors) * 0.2))
+                domain_scores[_] = score
+                domain_best = max(domain_best, score)
+
+        # Ambiguous-term domain preference (same token can mean different things)
+        ambiguous_bonus = 0.0
+        term_root = self._normalize_term(self.morphology.extract_root(term_norm)) if term_norm else ''
+        term_profile = self.ambiguous_term_domains.get(term_norm) or self.ambiguous_term_domains.get(term_root)
+        if term_profile and domain_scores:
+            best_domain = max(domain_scores, key=domain_scores.get)
+            ambiguous_bonus = term_profile.get(best_domain, 0.0)
+
+        # Local lexical coherence score (windowed overlap)
+        term_parts = set(term_norm.split()) if term_norm else set()
+        lexical = 0.0
+        if term_parts and context_tokens:
+            lexical = len(term_parts & context_tokens) / max(1, len(term_parts))
+
+        # Optional semantic compatibility when embeddings are available
+        semantic = 0.5
+        if self.embeddings_model is not None:
+            try:
+                embs = self.embeddings_model.encode(
+                    [term_norm, context_norm],
+                    convert_to_numpy=True,
+                    show_progress_bar=False,
+                    batch_size=16,
+                )
+                denom = (np.linalg.norm(embs[0]) * np.linalg.norm(embs[1])) + 1e-8
+                semantic = float(np.dot(embs[0], embs[1]) / denom)
+                semantic = max(0.0, min(1.0, semantic))
+            except Exception:
+                semantic = self._fallback_semantic_similarity(term_norm, context_norm)
+        else:
+            semantic = self._fallback_semantic_similarity(term_norm, context_norm)
+
+        score = (0.20 * lexical) + (0.30 * domain_best) + (0.40 * semantic) + (0.10 * ambiguous_bonus)
+        return float(max(0.0, min(1.0, score)))
+
+    def _load_corpus_tuned_disambiguation_domains(
+        self,
+        base_domains: Dict[str, Set[str]],
+    ) -> Dict[str, Set[str]]:
+        """Tune domain lexicons with frequent terms mined from essay corpus CSVs."""
+        domains = {k: set(v) for k, v in base_domains.items()}
+
+        candidate_files = [
+            Path(__file__).resolve().parent.parent / 'scoring-model-training' / 'akura_dataset.csv',
+            Path(__file__).resolve().parent.parent / 'scoring-model-training' / 'sinhala_dataset_final_with_dyslexic.csv',
+            Path(__file__).resolve().parent.parent / 'scoring-model-training' / 'sinhala_dataset_final.csv',
+        ]
+
+        domain_term_counts: Dict[str, Counter] = {d: Counter() for d in domains}
+        total_rows = 0
+
+        for csv_path in candidate_files:
+            if not csv_path.exists():
+                continue
+            try:
+                with open(csv_path, encoding='utf-8') as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        total_rows += 1
+                        topic = (row.get('essay_topic') or row.get('topic') or '').strip()
+                        text = (row.get('essay_text') or row.get('input_text') or '').strip()
+                        if not text:
+                            continue
+
+                        domain = self._infer_domain_from_topic(topic, text)
+                        if domain not in domain_term_counts:
+                            continue
+
+                        tokens = [self._normalize_term(t) for t in re.findall(r'[\u0D80-\u0DFF]{2,}', self._normalize_unicode(text))]
+                        for token in tokens:
+                            if (
+                                token
+                                and token not in self.stop_words
+                                and len(token) >= 3
+                                and token not in self.postpositions
+                                and token not in self.connectors
+                            ):
+                                lemma = self._normalize_term(self.morphology.get_citation_form(token))
+                                domain_term_counts[domain][lemma or token] += 1
+            except Exception as e:
+                logger.warning("Failed to mine lexicon from %s: %s", csv_path, e)
+
+        # Merge top high-frequency domain terms into base anchors
+        for domain, counter in domain_term_counts.items():
+            if not counter:
+                continue
+            for token, freq in counter.most_common(120):
+                if freq >= 3:
+                    domains[domain].add(token)
+
+        logger.info(
+            "Loaded corpus-tuned disambiguation lexicons from %d rows; sizes=%s",
+            total_rows,
+            {k: len(v) for k, v in domains.items()},
+        )
+        return domains
+
+    def _infer_domain_from_topic(self, topic: str, text: str) -> str:
+        """Infer domain label from essay topic (or early text if topic missing)."""
+        candidate = self._normalize_unicode(topic or text[:120]).lower()
+        rules = {
+            'education': ['පාසල්', 'ශිෂ්‍ය', 'ගුරු', 'අධ්‍යාපන', 'ඉගෙන', 'විභාග', 'රචන'],
+            'science': ['විද්‍ය', 'තාක්ෂණ', 'පර්යේෂණ', 'රසායන', 'භෞතික', 'ජීව'],
+            'society': ['සමාජ', 'ජන', 'ප්‍රජා', 'සංස්කෘති', 'මාධ්‍ය', 'ගම්මාන'],
+            'environment': ['පරිසර', 'වනය', 'ජල', 'ගංවතුර', 'දේශගුණ', 'දූෂණ'],
+            'health': ['සෞඛ්‍ය', 'රෝග', 'ආහාර', 'ව්‍යායාම', 'වෛද්‍ය', 'නිරෝගී'],
+        }
+        best_domain = 'society'
+        best_score = 0
+        for domain, keys in rules.items():
+            score = sum(1 for k in keys if k in candidate)
+            if score > best_score:
+                best_score = score
+                best_domain = domain
+        return best_domain
+
+    def _build_ambiguous_term_domains(
+        self,
+        domains: Dict[str, Set[str]],
+    ) -> Dict[str, Dict[str, float]]:
+        """Build ambiguous-term domain preference map from overlapping domain lexicons."""
+        term_to_domains: Dict[str, Set[str]] = defaultdict(set)
+        for domain, tokens in domains.items():
+            for t in tokens:
+                term_to_domains[t].add(domain)
+
+        # Keep terms present in 2+ domains as ambiguous and assign soft priors
+        ambiguous: Dict[str, Dict[str, float]] = {}
+        for term, dset in term_to_domains.items():
+            if len(dset) < 2:
+                continue
+            # uniform prior over candidate domains
+            prior = 1.0 / len(dset)
+            ambiguous[term] = {d: prior for d in dset}
+
+        # Inject known high-impact ambiguous Sinhala terms with stronger priors
+        ambiguous.update({
+            self._normalize_term('විද්‍යාව'): {'science': 0.7, 'education': 0.3},
+            self._normalize_term('අධ්‍යයනය'): {'education': 0.55, 'science': 0.45},
+            self._normalize_term('පද්ධතිය'): {'science': 0.5, 'society': 0.3, 'environment': 0.2},
+            self._normalize_term('සංවර්ධනය'): {'society': 0.5, 'environment': 0.3, 'education': 0.2},
+            self._normalize_term('රටාව'): {'science': 0.4, 'society': 0.4, 'education': 0.2},
+            self._normalize_term('ජාලය'): {'science': 0.6, 'society': 0.4},
+        })
+        return ambiguous
     
     def _simple_cluster(self, entities: List[Dict]) -> List[List[Dict]]:
         """Simple clustering based on text patterns."""
