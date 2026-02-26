@@ -56,6 +56,51 @@ cp .env.example .env
 # Edit .env file with your settings if needed
 ```
 
+## Quick Commands (Simple)
+
+### Windows (PowerShell)
+
+```powershell
+cd E:\Codes\RP\sinhala-visual-mapping-service
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python app.py
+```
+
+### Linux / macOS
+
+```bash
+cd /path/to/sinhala-visual-mapping-service
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+### Evaluate (Run Tests)
+
+```bash
+# all tests
+pytest -q
+
+# core benchmark only
+pytest tests/test_extraction_benchmarks.py -q
+
+# key quality/regression tests
+pytest tests/test_intelligent_generator.py tests/test_regression_patterns.py tests/test_mindmap_generator.py tests/test_api_endpoints.py -q
+```
+
+### Quick API Check
+
+```bash
+curl http://localhost:5000/health
+
+curl -X POST http://localhost:5000/api/mindmap/generate \
+  -H "Content-Type: application/json" \
+  -d '{"text":"ශ්‍රී ලංකාව දකුණු ආසියාවේ පිහිටි දිවයිනකි.","intelligent":true}'
+```
+
 ## Usage
 
 ### Starting the API Server
