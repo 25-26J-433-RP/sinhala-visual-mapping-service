@@ -36,12 +36,16 @@ Usage::
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+from sinhala_morphology import get_morphology_handler, normalize_sinhala_word
 
 logger = logging.getLogger(__name__)
 
@@ -78,26 +82,64 @@ _TYPE_PROTOTYPES: Dict[str, List[str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Lexical marker lists (mirrors nlp_engine but scoped here for independence)
+# ENHANCED Lexical marker lists (EXPANDED from ~30 to ~90 markers)
+# Includes student essay patterns for better classification accuracy
 # ---------------------------------------------------------------------------
 _MARKERS: Dict[str, List[str]] = {
+    # IS-A markers: 9 → 30 markers (definitional, taxonomic, classification)
     REL_IS_A: [
+        # Basic definitional markers
         "යනු", "හෙවත්", "කියන", "අර්ථය", "අර්ථයෙන්",
         "හැඳින්වෙයි", "ලෙස", "ලෙසින්",
-        "උදාහරණ", "උදාහරණයක්", "උදා:",
+        # Essay-style definitions
+        "නිර්වචනය කළ හැක්කේ", "අර්ථ දක්වන්නේ", "හඳුන්වන්නේ",
+        "ගණ්‍ය කරයි", "ශ්‍රේණිගත කරයි", "වර්ගය", "ප්‍රභේදය",
+        # Exemplification (is-a through examples)
+        "උදාහරණ", "උදාහරණයක්", "උදා:", "උදාහරණයක් ලෙස",
+        "එනම්", "එබැවින්", "මෙහිදී", "මෙසේ",
+        # Academic classification
+        "ලෙස හඳුන්වන", "ලෙස නිර්වචනය කෙරේ", "ලෙස සැලකේ",
+        "වේ", "වන", "වූ", "වන්නේ",
     ],
+    
+    # PART-OF markers: 8 → 20 markers (compositional, membership, inclusion)
     REL_PART_OF: [
+        # Basic part/whole markers
         "අංශය", "කොටස", "අයත්", "අංග", "අභ්‍යන්තර",
         "භාගය", "ශාඛාව", "කොටසකි",
+        # Extended compositional markers
+        "කොටසක් වේ", "අයිති", "ඇතුළත්", "අඩංගු",
+        "සමන්විත", "සමුදායේ", "කොටසක්", "දෙකොටස",
+        # Membership and inclusion
+        "අයිති වේ", "අයත් වේ", "තුළ පවතී", "ඇතුළත් වේ",
     ],
+    
+    # CAUSE-EFFECT markers: 9 → 25 markers (causal, functional, consequential)
     REL_CAUSE: [
+        # Basic causal markers
         "නිසා", "හේතුවෙන්", "ප්‍රතිඵලයෙන්",
         "ප්‍රතිඵලයක් ලෙස", "ඒ හේතුවෙන්",
+        # Action and causation
         "කරන", "ඇති කරයි", "සිදු කරයි",
+        "ජනනය කරයි", "ඇතිවේ", "හේතුවක් වේ",
+        # Essay-style causation
+        "මේ හේතුව නිසා", "එම නිසා", "ඉන් ප්‍රතිඵලයක් ලෙස",
+        "ප්‍රේරණය කරයි", "වටා ගැනීමට හේතුව", "බලපායි",
+        # Consequence and result
+        "ප්‍රතිඵලය", "ප්‍රතිඵලයන්", "ප්‍රතිඵල", "හේතුව",
+        "ප්‍රතිඵලයක්", "හේතු", "හේතූන්", "බලපෑම",
+        # Reason and explanation
+        "හේතුවට", "හේතුවෙන් වශයෙන්", "හේතුවෙන්ම",
     ],
+    
+    # RELATED-TO markers: 8 → 15 markers (association, conjunction, proximity)
     REL_RELATED: [
+        # Basic association markers
         "සහ", "හා", "මෙන්ම", "සමඟ", "ද", "සම්බන්ධ",
         "ආශ්‍රිත", "ආශ්‍රිතය",
+        # Extended association
+        "සම්බන්ධව", "සම්බන්ධයෙන්", "සමාන", "සමානව",
+        "සමකාලීන", "එකට", "එක්ව",
     ],
 }
 
@@ -106,6 +148,7 @@ _MARKERS: Dict[str, List[str]] = {
 # ---------------------------------------------------------------------------
 
 # Postpositions / particles that reveal the role of the word that PRECEDES them.
+# ENHANCED: Expanded from 23 to 60+ entries for better syntactic directionality
 # Format:  token → role assigned to the preceding entity
 #   'cause_src'   – preceding entity is the CAUSE   (source in cause-effect)
 #   'cause_tgt'   – preceding entity is the EFFECT  (target in cause-effect)
@@ -114,47 +157,125 @@ _MARKERS: Dict[str, List[str]] = {
 #   'part_whole'  – preceding entity is the WHOLE   (target in part-of)
 #   'agent'       – preceding entity is the AGENT   (source, any relation)
 _POST_ROLE: Dict[str, str] = {
-    # causal cues (cause precedes cue)
-    'නිසා':          'cause_src',
-    'හේතුවෙන්':      'cause_src',
-    'ප්‍රතිඵලයෙන්':   'cause_src',
-    'ඒ හේතුවෙන්':    'cause_src',
-    'මගින්':         'cause_src',
-    # agent marker
-    'විසින්':        'agent',
-    # definitional (child precedes cue)
-    'යනු':          'isa_child',
-    'හෙවත්':        'isa_child',
-    'ලෙස':          'isa_child',
-    'ලෙසින්':       'isa_child',
-    'ලෙස හඳුන්වේ':  'isa_child',
-    'ලෙස නිර්වචනය': 'isa_child',
-    # genitive → preceding word is the WHOLE (target of part-of)
-    'ගේ':           'part_whole',
-    'හි':           'part_whole',
-    'ල':            'part_whole',
-    'වල':           'part_whole',
-    # part markers → preceding word is the PART (source of part-of)
-    'කොටසකි':       'part_part',
-    'කොටසක්':      'part_part',
-    'කොටස':        'part_part',
-    'අංශය':        'part_part',
-    'ශාඛාව':        'part_part',
-    'අයිතිය':       'part_part',
+    # ── Causal cues (cause precedes cue) ──────────────────────────────────
+    'නිසා':                 'cause_src',
+    'හේතුවෙන්':             'cause_src',
+    'ප්‍රතිඵලයෙන්':          'cause_src',
+    'ඒ හේතුවෙන්':           'cause_src',
+    'මගින්':                'cause_src',
+    'හේතුවට':              'cause_src',
+    'හේතුවෙන් වශයෙන්':      'cause_src',
+    'නිසා වශයෙන්':          'cause_src',
+    'බව නිසා':             'cause_src',
+    'මුල්':                 'cause_src',
+    'සලකා':                'cause_src',
+    
+    # ── Effect/result markers (preceding entity receives effect) ───────────
+    'ලැබේ':                'cause_tgt',
+    'වේ':                   'cause_tgt',
+    'ඇතිවේ':               'cause_tgt',
+    'සිදු වේ':              'cause_tgt',
+    'ඇති වූ':               'cause_tgt',
+    'සිදුවූ':               'cause_tgt',
+    
+    # ── Agent markers ──────────────────────────────────────────────────────
+    'විසින්':               'agent',
+    'විසින් කරන ලද':        'agent',
+    'මගින්':                'agent',
+    'තුළින්':               'agent',
+    'හරහා':                'agent',
+    
+    # ── Definitional markers (child precedes cue) ──────────────────────────
+    'යනු':                 'isa_child',
+    'හෙවත්':               'isa_child',
+    'ලෙස':                 'isa_child',
+    'ලෙසින්':              'isa_child',
+    'ලෙස හඳුන්වේ':         'isa_child',
+    'ලෙස නිර්වචනය':        'isa_child',
+    'ලෙස අර්ථ දක්වයි':     'isa_child',
+    'ලෙස හඳුන්වන්නේ':      'isa_child',
+    'ලෙස සැලකේ':           'isa_child',
+    'වශයෙන්':              'isa_child',
+    'වේ':                  'isa_child',
+    'වන':                  'isa_child',
+    'විට':                 'isa_child',
+    
+    # ── Genitive (preceding word is the WHOLE - target of part-of) ─────────
+    'ගේ':                  'part_whole',
+    'හි':                  'part_whole',
+    'ල':                   'part_whole',
+    'වල':                  'part_whole',
+    'තුළ':                 'part_whole',
+    'තුළ ඇති':             'part_whole',
+    'අතර':                'part_whole',
+    'අතරින්':              'part_whole',
+    'සියල්ලෙහි':           'part_whole',
+    'ඇතුලු':               'part_whole',
+    'අන්තර්ගත':           'part_whole',
+    
+    # ── Part markers (preceding word is the PART - source of part-of) ──────
+    'කොටසකි':              'part_part',
+    'කොටසක්':             'part_part',
+    'කොටස':               'part_part',
+    'අංශය':               'part_part',
+    'ශාඛාව':               'part_part',
+    'අයිතිය':              'part_part',
+    'අයත්':               'part_part',
+    'අයත් වන':            'part_part',
+    'අඩංගු':              'part_part',
+    'ඇතුළත්':             'part_part',
+    'භාගය':               'part_part',
+    'දෙකොටස':             'part_part',
+    'අංගයකි':             'part_part',
+    'අපේක්ෂා':            'part_part',
 }
 
+# ENHANCED Verb/predicate patterns for better directionality resolution
 # Verb/predicate patterns that, when they appear AFTER an entity, signal
 # that the entity just BEFORE the verb is the EFFECT / product (target).
 _EFFECT_VERBS: List[str] = [
+    # Result verbs (entity receives the action/effect)
     'ඇතිවේ', 'ජනනය', 'නිෂ්පාදනය', 'ඇති කරයි', 'සිදු කරයි',
     'ලබා දෙයි', 'ලබා ගනී', 'කෙරේ', 'වේ', 'ඇති', 'ශාකය',
+    # Extended result/state verbs
+    'ලැබේ', 'ලැබුණි', 'සිදු වේ', 'සිදුවේ', 'සිදු වූ', 'සිදුවූ',
+    'ඇතිවූ', 'ඇති වූ', 'ඇති වන', 'ඇතිවන', 'නිර්මාණය',
+    'හටගනී', 'හටගත්', 'පැන නගී', 'බිහිවේ', 'විකසිත',
+    # Essay-specific result verbs
+    'දියුණු වේ', 'වර්ධනය වේ', 'වර්ධනය', 'පැවතුනි',
+    'පැවතී', 'ඇති කෙරේ', 'බිහි කරයි', 'ජනිත',
 ]
 
 # If an entity precedes one of these verbs, it is the AGENT/CAUSE (source).
 _AGENT_VERBS: List[str] = [
+    # Causative/transitive verbs (entity performs the action)
     'නිෂ්පාදනය කරයි', 'ජනනය කරයි', 'ඇති කරයි', 'ලබා දෙයි',
     'ඉදිරිපත් කරයි', 'නිපදවයි', 'ඇතිකරයි',
+    # Extended causative verbs
+    'ඇති කරන', 'සිදු කරන', 'සිදු කරයි', 'නිර්මාණය කරයි',
+    'නිර්මාණය කරන', 'බලපායි', 'බලපාන', 'බලපෑම් කරයි',
+    'ප්‍රේරණය කරයි', 'හේතු වෙයි', 'හේතු වන', 'හේතුකොට',
+    # Essay-specific causative verbs
+    'දියුණු කරයි', 'වර්ධනය කරයි', 'පෝෂණය කරයි',
+    'සාර්ථක කරයි', 'ශක්තිමත් කරයි', 'වැඩිදියුණු කරයි',
+    'මෙහෙයවයි', 'මඟ පෙන්වයි', 'යොමු කරයි',
 ]
+
+_DIRECTIONALITY_CUES: Tuple[str, ...] = tuple(
+    sorted(set([*_POST_ROLE.keys(), *_EFFECT_VERBS, *_AGENT_VERBS]), key=len, reverse=True)
+)
+
+_CLAUSE_BOUNDARY_MARKERS: Tuple[str, ...] = (
+    ",",
+    ";",
+    ":",
+    " - ",
+    " — ",
+    " නමුත් ",
+    " එහෙත් ",
+    " නම් ",
+    " විට ",
+)
 
 
 class DirectionResolver:
@@ -365,7 +486,7 @@ _direction_resolver = DirectionResolver()
 
 # Rows → canonical types  |  Columns → feature dimensions (see _feature_names)
 #
-# Feature dimensions (14 total):
+# Feature dimensions (23 total):
 #  [0]  lex_is_a_between      marker presence between entities
 #  [1]  lex_part_between
 #  [2]  lex_cause_between
@@ -380,14 +501,49 @@ _direction_resolver = DirectionResolver()
 #  [11] between_cause_sim
 #  [12] same_sentence          1.0 / 0.0
 #  [13] distance_norm          1 - dist/max_dist, in [0,1]
+#  [14] between_marker_density lexical intensity between entities
+#  [15] morph_root_match       normalised root overlap flag
+#  [16] morph_inflected_match  inflectional-variant flag
+#  [17] e1_case_suffix         whether source entity ends in case marker
+#  [18] e2_case_suffix         whether target entity ends in case marker
+#  [19] between_connector      conjunction marker between entities
+#  [20] cue_position           relative position of strongest directionality cue in between-span
+#  [21] dependency_like_distance token/clause weighted proximity proxy
+#  [22] clause_boundary        whether between-span crosses an internal clause boundary
 # ---------------------------------------------------------------------------
+_FEATURE_NAMES: List[str] = [
+    "lex_is_a_between",
+    "lex_part_between",
+    "lex_cause_between",
+    "lex_related_between",
+    "lex_is_a_context",
+    "lex_part_context",
+    "lex_cause_context",
+    "lex_related_context",
+    "embed_sim",
+    "between_is_a_sim",
+    "between_part_sim",
+    "between_cause_sim",
+    "same_sentence",
+    "distance_norm",
+    "between_marker_density",
+    "morph_root_match",
+    "morph_inflected_match",
+    "e1_case_suffix",
+    "e2_case_suffix",
+    "between_connector",
+    "cue_position",
+    "dependency_like_distance",
+    "clause_boundary",
+]
+
 _WEIGHT_MATRIX = np.array([
-    # is-a   part   cause  rel    is-a*  part*  cause* rel*   esim   b_is  b_pt  b_ca  ssent  dist
-    [  1.40,  0.00,  0.00,  0.00,  0.80,  0.00,  0.00,  0.00,  0.00,  1.00, 0.00, 0.00, 0.30,  0.10],  # is-a
-    [  0.00,  1.40,  0.00,  0.00,  0.00,  0.80,  0.00,  0.00,  0.00,  0.00, 1.00, 0.00, 0.30,  0.10],  # part-of
-    [  0.00,  0.00,  1.40,  0.00,  0.00,  0.00,  0.90,  0.00,  0.00,  0.00, 0.00, 1.00, 0.30,  0.10],  # cause-effect
-    [  0.00,  0.00,  0.00,  0.70,  0.00,  0.00,  0.00,  0.40,  0.50,  0.00, 0.00, 0.00, 0.40,  0.30],  # related-to
-], dtype=np.float64)  # shape (4, 14)
+    # is-a   part   cause  rel    is-a*  part*  cause* rel*   esim   b_is  b_pt  b_ca  ssent  dist  dens root infl e1cs e2cs conn  cuep  depd  clbd
+    [  1.40,  0.00,  0.00,  0.00,  0.80,  0.00,  0.00,  0.00,  0.00,  1.00, 0.00, 0.00, 0.30,  0.10, 0.20, 0.10, 0.00, 0.00, 0.00, 0.05, 0.02, 0.08, -0.05],
+    [  0.00,  1.40,  0.00,  0.00,  0.00,  0.80,  0.00,  0.00,  0.00,  0.00, 1.00, 0.00, 0.30,  0.10, 0.15, 0.00, 0.00, 0.10, 0.20, 0.00, 0.00, 0.10, -0.04],
+    [  0.00,  0.00,  1.40,  0.00,  0.00,  0.00,  0.90,  0.00,  0.00,  0.00, 0.00, 1.00, 0.30,  0.10, 0.20, 0.00, 0.00, 0.05, 0.05, 0.00, 0.12, 0.12, 0.06],
+    [  0.00,  0.00,  0.00,  0.70,  0.00,  0.00,  0.00,  0.40,  0.50,  0.00, 0.00, 0.00, 0.40,  0.30, 0.10, 0.35, 0.30, 0.00, 0.00, 0.35, 0.00, 0.10, 0.04],
+], dtype=np.float64)  # shape (4, 23)
 
 # Bias terms per class (log-prior)
 _BIAS = np.array([-0.40, -0.50, -0.40, 0.10], dtype=np.float64)
@@ -400,6 +556,10 @@ _NGRAM_SIM_GATE: float = 0.45      # character n-gram similarity gate
 _MAX_SENT_DISTANCE: int = 2        # max sentence index gap for cross-sentence pairs
 _MAX_OFFSET_DISTANCE: int = 600    # max character offset gap for proximity pairs
 _MAX_PAIRS_PER_NODE: int = 6       # cap pairs per source node to avoid O(n²) explosion
+_TOP_K_CONTEXTS_PER_PAIR: int = 3  # retain top-k contexts for each text-pair
+
+_RELATION_MODEL_ENV = "RELATION_CLASSIFIER_MODEL_PATH"
+_DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "models" / "relation_classifier_model.json"
 
 
 def _softmax(x: np.ndarray) -> np.ndarray:
@@ -431,7 +591,185 @@ class RelationClassifier:
     def __init__(self, nlp_engine: Any) -> None:
         self.engine = nlp_engine
         self._proto_embs: Optional[Dict[str, np.ndarray]] = None
+        self._morph = get_morphology_handler()
+        self._trained_model: Optional[Dict[str, Any]] = None
         self._init_prototype_embeddings()
+        self._load_trained_model()
+        # Base thresholds (will be adjusted adaptively)
+        self._base_thresholds = {
+            REL_IS_A: 0.42,
+            REL_PART_OF: 0.48,
+            REL_CAUSE: 0.45,
+            REL_RELATED: 0.38,
+        }
+        self._domain_rel_offsets: Dict[str, Dict[str, float]] = {
+            'education':   {REL_IS_A: -0.02, REL_PART_OF: -0.01, REL_CAUSE: 0.00, REL_RELATED: -0.02},
+            'science':     {REL_IS_A: 0.00,  REL_PART_OF: 0.00,  REL_CAUSE: 0.01, REL_RELATED: 0.00},
+            'environment': {REL_IS_A: 0.00,  REL_PART_OF: 0.01,  REL_CAUSE: 0.02, REL_RELATED: 0.00},
+            'health':      {REL_IS_A: -0.01, REL_PART_OF: 0.00,  REL_CAUSE: 0.01, REL_RELATED: -0.01},
+            'society':     {REL_IS_A: 0.00,  REL_PART_OF: 0.00,  REL_CAUSE: 0.01, REL_RELATED: 0.01},
+        }
+        self._noise_rel_offsets: Dict[str, Dict[str, float]] = {
+            'clean':  {REL_IS_A: -0.02, REL_PART_OF: -0.01, REL_CAUSE: -0.01, REL_RELATED: -0.02},
+            'medium': {REL_IS_A: 0.00,  REL_PART_OF: 0.00,  REL_CAUSE: 0.00,  REL_RELATED: 0.00},
+            'noisy':  {REL_IS_A: 0.05,  REL_PART_OF: 0.04,  REL_CAUSE: 0.05,  REL_RELATED: 0.06},
+        }
+
+    def _resolve_model_path(self) -> Path:
+        env_path = os.getenv(_RELATION_MODEL_ENV, "").strip()
+        if env_path:
+            return Path(env_path)
+        return _DEFAULT_MODEL_PATH
+
+    def _load_trained_model(self) -> None:
+        path = self._resolve_model_path()
+        if not path.exists():
+            logger.info("RelationClassifier: no trained relation model found at %s; using fallback weights.", path)
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            feature_names = payload.get("feature_names", [])
+            classes = payload.get("classes", [])
+            coef = np.array(payload.get("coefficients", []), dtype=np.float64)
+            intercept = np.array(payload.get("intercepts", []), dtype=np.float64)
+            scaler_mean = np.array(payload.get("scaler_mean", []), dtype=np.float64)
+            scaler_scale = np.array(payload.get("scaler_scale", []), dtype=np.float64)
+
+            if feature_names != _FEATURE_NAMES:
+                raise ValueError("feature_names mismatch between runtime and model artifact")
+            if classes != CANONICAL_TYPES:
+                raise ValueError("class ordering mismatch between runtime and model artifact")
+            if coef.shape != (len(CANONICAL_TYPES), len(_FEATURE_NAMES)):
+                raise ValueError(f"unexpected coefficient matrix shape: {coef.shape}")
+            if intercept.shape != (len(CANONICAL_TYPES),):
+                raise ValueError(f"unexpected intercept shape: {intercept.shape}")
+            if scaler_mean.shape != (len(_FEATURE_NAMES),) or scaler_scale.shape != (len(_FEATURE_NAMES),):
+                raise ValueError("invalid scaler statistics in model artifact")
+
+            scaler_scale = np.where(scaler_scale == 0.0, 1.0, scaler_scale)
+            self._trained_model = {
+                "coef": coef,
+                "intercept": intercept,
+                "scaler_mean": scaler_mean,
+                "scaler_scale": scaler_scale,
+                "path": str(path),
+                "metadata": payload.get("metadata", {}),
+            }
+            logger.info("RelationClassifier: loaded trained relation model from %s", path)
+        except Exception as exc:
+            self._trained_model = None
+            logger.warning("RelationClassifier: failed loading model %s, using fallback weights. Error: %s", path, exc)
+
+    def _predict_probs(self, feat: np.ndarray) -> np.ndarray:
+        if self._trained_model is not None:
+            mean = self._trained_model["scaler_mean"]
+            scale = self._trained_model["scaler_scale"]
+            z = (feat - mean) / scale
+            logits = self._trained_model["coef"] @ z + self._trained_model["intercept"]
+            return _softmax(logits)
+        logits = _WEIGHT_MATRIX @ feat + _BIAS
+        return _softmax(logits)
+
+    def _calibrate_candidate_gates(self, domain: str, noise_bucket: str) -> Dict[str, float]:
+        """Calibrate candidate pair generation gates by domain/noise bucket."""
+        embed_gate = _EMBED_SIM_GATE
+        ngram_gate = _NGRAM_SIM_GATE
+        max_sent_distance = _MAX_SENT_DISTANCE
+        max_offset_distance = _MAX_OFFSET_DISTANCE
+        max_pairs_per_node = _MAX_PAIRS_PER_NODE
+
+        if noise_bucket == 'clean':
+            embed_gate -= 0.03
+            ngram_gate -= 0.02
+            max_sent_distance += 1
+            max_offset_distance += 80
+        elif noise_bucket == 'noisy':
+            embed_gate += 0.07
+            ngram_gate += 0.05
+            max_sent_distance -= 1
+            max_offset_distance -= 120
+            max_pairs_per_node = max(3, max_pairs_per_node - 2)
+
+        if domain in {'science', 'environment'}:
+            embed_gate += 0.02
+            ngram_gate += 0.01
+        elif domain == 'education':
+            embed_gate -= 0.01
+
+        calibrated = {
+            'embed_gate': max(0.25, min(0.70, embed_gate)),
+            'ngram_gate': max(0.30, min(0.70, ngram_gate)),
+            'max_sent_distance': int(max(1, min(3, max_sent_distance))),
+            'max_offset_distance': int(max(320, min(900, max_offset_distance))),
+            'max_pairs_per_node': int(max(3, min(8, max_pairs_per_node))),
+        }
+        return calibrated
+
+    def _calculate_adaptive_thresholds(
+        self,
+        text: str,
+        entities: List[Dict[str, Any]]
+    ) -> Dict[str, float]:
+        """
+        Calculate adaptive confidence thresholds based on text characteristics.
+        
+        Adjusts thresholds lower for:
+        - Longer, more complex essays (more context = more reliable)
+        - Higher entity density (more concepts = clearer relationships)
+        - Higher average entity confidence (better extraction quality)
+        
+        Adjusts thresholds higher for:
+        - Short, simple texts (less context = less reliable)
+        - Low entity density (sparse concepts)
+        - Lower entity confidence (noisy extraction)
+        
+        Returns
+        -------
+        Dict[str, float]
+            Per-type adjusted thresholds
+        """
+        profile = self.engine.assess_text_bucket(text)
+        domain = profile.get('domain', 'society')
+        noise_bucket = profile.get('noise_bucket', 'medium')
+
+        # Text complexity metrics
+        text_length = len(text)
+        num_entities = len(entities)
+        num_sentences = len(self.engine._split_sentences_with_spans(text))
+        
+        # Entity quality metrics
+        avg_entity_confidence = sum(e.get("confidence", 0.5) for e in entities) / max(num_entities, 1)
+        entity_density = num_entities / max(num_sentences, 1)  # entities per sentence
+        
+        # Normalization factors
+        length_factor = min(1.0, text_length / 800)  # normalize to ~800 chars (typical essay paragraph)
+        density_factor = min(1.0, entity_density / 4.0)  # normalize to 4 entities/sentence
+        quality_factor = avg_entity_confidence  # already in [0,1]
+        
+        # Combined adjustment factor: higher = lower threshold (more permissive)
+        # Formula: avg of three factors, weighted towards quality
+        adjustment = (0.3 * length_factor + 0.3 * density_factor + 0.4 * quality_factor)
+        
+        # Apply adjustment to base thresholds
+        # Adjustment range: -0.08 to +0.08 from base
+        # Higher adjustment = lower threshold (subtract more)
+        adaptive_thresholds = {}
+        for rel_type, base in self._base_thresholds.items():
+            # Adjust: reduce threshold when adjustment is high (good quality text)
+            # Increase threshold when adjustment is low (poor quality text)
+            adjusted = base - (adjustment - 0.5) * 0.16  # 0.16 = 2 * max_adjustment
+            adjusted += self._domain_rel_offsets.get(domain, {}).get(rel_type, 0.0)
+            adjusted += self._noise_rel_offsets.get(noise_bucket, {}).get(rel_type, 0.0)
+            # Clamp to reasonable bounds
+            adaptive_thresholds[rel_type] = max(0.25, min(0.65, adjusted))
+        
+        logger.debug(
+            f"Adaptive thresholds: length={text_length}, entities={num_entities}, "
+            f"density={entity_density:.2f}, quality={avg_entity_confidence:.2f}, "
+            f"adjustment={adjustment:.2f}, domain={domain}, noise={noise_bucket}, thresholds={adaptive_thresholds}"
+        )
+        
+        return adaptive_thresholds
 
     # =========================================================================
     # Public API
@@ -466,33 +804,50 @@ class RelationClassifier:
 
         sentences = self.engine._split_sentences_with_spans(text)
 
+        # ── Calculate adaptive thresholds based on text characteristics ───────
+        adaptive_thresholds = self._calculate_adaptive_thresholds(text, entities)
+        profile = self.engine.assess_text_bucket(text)
+        domain = profile.get('domain', 'society')
+        noise_bucket = profile.get('noise_bucket', 'medium')
+        candidate_gates = self._calibrate_candidate_gates(domain, noise_bucket)
+
         # ── Stage 1: candidate pairs ──────────────────────────────────────────
-        candidates = self._generate_candidates(entities, sentences, text)
+        candidates = self._generate_candidates(entities, sentences, text, candidate_gates)
 
         # ── Stage 2: classify each candidate ─────────────────────────────────
-        relationships: Dict[tuple, Dict[str, Any]] = {}
+        # Keep all context-level predictions first, then aggregate by directed
+        # relation key so confidence reflects multi-context evidence.
+        aggregated_by_key: Dict[tuple, List[Dict[str, Any]]] = {}
         for pair in candidates:
             rel = self._classify_pair(pair, text)
             if rel is None:
                 continue
-            threshold = self.engine.rel_thresholds.get(rel["type"], 0.45)
-            if rel["confidence"] < threshold:
-                continue
-            # Use DIRECTED key: (source, target, type) — preserves orientation.
-            # If the same undirected pair was seen with higher confidence,
-            # keep that, but also allow both (A→B) and (B→A) if they survive
-            # with different detected types.
             key = (rel["source"], rel["target"], rel["type"])
-            rev_key = (rel["target"], rel["source"], rel["type"])
-            # Prefer the orientation with the highest direction_score
+            aggregated_by_key.setdefault(key, []).append(rel)
+
+        relationships: Dict[tuple, Dict[str, Any]] = {}
+        for key, evidence in aggregated_by_key.items():
+            merged = self._aggregate_relation_evidence(evidence)
+
+            threshold = adaptive_thresholds.get(merged["type"], 0.45)
+            if merged["confidence"] < threshold:
+                continue
+
+            rev_key = (merged["target"], merged["source"], merged["type"])
             if rev_key in relationships:
                 existing = relationships[rev_key]
-                if rel["direction_score"] > existing["direction_score"]:
+                # Prefer stronger directionality; break ties by confidence.
+                if (
+                    merged["direction_score"] > existing["direction_score"]
+                    or (
+                        merged["direction_score"] == existing["direction_score"]
+                        and merged["confidence"] > existing["confidence"]
+                    )
+                ):
                     del relationships[rev_key]
-                    relationships[key] = rel
-                # else keep existing orientation
-            elif key not in relationships or relationships[key]["confidence"] < rel["confidence"]:
-                relationships[key] = rel
+                    relationships[key] = merged
+            elif key not in relationships or relationships[key]["confidence"] < merged["confidence"]:
+                relationships[key] = merged
 
         result = sorted(relationships.values(), key=lambda r: r["confidence"], reverse=True)
         return result
@@ -506,6 +861,7 @@ class RelationClassifier:
         entities: List[Dict[str, Any]],
         sentences: List[Tuple[str, int]],
         full_text: str,
+        gates: Dict[str, float],
     ) -> List[Dict[str, Any]]:
         """
         Shortlist entity pairs using four complementary criteria.
@@ -524,19 +880,24 @@ class RelationClassifier:
                     return idx, s
             return -1, entity.get("context", "")
 
-        seen: set = set()
-        candidates: List[Dict[str, Any]] = []
+        pair_candidates: Dict[tuple, List[Dict[str, Any]]] = {}
         pair_count: Dict[str, int] = {}  # source key → count
 
         # Pre-compute embeddings for all entities (single batch call)
         entity_embs = self._batch_embed([e["text"] for e in entities])
+
+        embed_gate = float(gates.get('embed_gate', _EMBED_SIM_GATE))
+        ngram_gate = float(gates.get('ngram_gate', _NGRAM_SIM_GATE))
+        max_sent_distance = int(gates.get('max_sent_distance', _MAX_SENT_DISTANCE))
+        max_offset_distance = int(gates.get('max_offset_distance', _MAX_OFFSET_DISTANCE))
+        max_pairs_per_node = int(gates.get('max_pairs_per_node', _MAX_PAIRS_PER_NODE))
 
         n = len(entities)
         for i in range(n):
             src_key = entities[i].get("normalized") or entities[i]["text"]
 
             for j in range(i + 1, n):
-                if pair_count.get(src_key, 0) >= _MAX_PAIRS_PER_NODE:
+                if pair_count.get(src_key, 0) >= max_pairs_per_node:
                     break
 
                 e1, e2 = entities[i], entities[j]
@@ -544,7 +905,8 @@ class RelationClassifier:
                     continue
 
                 pair_key = tuple(sorted([e1["text"], e2["text"]]))
-                if pair_key in seen:
+                is_new_pair_for_src = pair_key not in pair_candidates
+                if is_new_pair_for_src and pair_count.get(src_key, 0) >= max_pairs_per_node:
                     continue
 
                 si, s1_text = sent_idx_of(e1)
@@ -557,22 +919,22 @@ class RelationClassifier:
                 # Gate 1: same sentence
                 qualifies = same_sent
                 # Gate 2: adjacent sentence
-                if not qualifies and sent_dist <= _MAX_SENT_DISTANCE:
+                if not qualifies and sent_dist <= max_sent_distance:
                     qualifies = True
                 # Gate 3: embedding similarity
                 if not qualifies and entity_embs is not None:
                     esim = self._cosine(entity_embs[i], entity_embs[j])
-                    if esim >= _EMBED_SIM_GATE:
+                    if esim >= embed_gate:
                         qualifies = True
                 # Gate 4: character n-gram root similarity
                 if not qualifies:
                     ng = _char_ngram_sim(e1["text"], e2["text"])
-                    if ng >= _NGRAM_SIM_GATE:
+                    if ng >= ngram_gate:
                         qualifies = True
 
                 if not qualifies:
                     continue
-                if off_dist > _MAX_OFFSET_DISTANCE and not same_sent:
+                if off_dist > max_offset_distance and not same_sent:
                     continue
 
                 # Choose best context sentence
@@ -583,21 +945,110 @@ class RelationClassifier:
                     if entity_embs is not None else 0.50
                 )
 
-                seen.add(pair_key)
-                pair_count[src_key] = pair_count.get(src_key, 0) + 1
-                candidates.append({
+                context_score = self._context_quality_score(
+                    context=context,
+                    same_sentence=same_sent,
+                    sent_distance=sent_dist,
+                    offset_distance=off_dist,
+                    embed_sim=float(emb_sim),
+                )
+
+                if is_new_pair_for_src:
+                    pair_count[src_key] = pair_count.get(src_key, 0) + 1
+
+                pair_candidates.setdefault(pair_key, []).append({
                     "e1": e1, "e2": e2,
                     "context": context,
                     "same_sentence": same_sent,
                     "sent_distance": sent_dist,
                     "offset_distance": off_dist,
                     "embed_sim": float(emb_sim),
+                    "context_score": context_score,
                     "e1_emb_idx": i,
                     "e2_emb_idx": j,
                     "_entity_embs": entity_embs,
                 })
 
+        candidates: List[Dict[str, Any]] = []
+        for _, evidence in pair_candidates.items():
+            ranked = sorted(
+                evidence,
+                key=lambda c: (
+                    c.get("context_score", 0.0),
+                    1.0 if c.get("same_sentence") else 0.0,
+                    c.get("embed_sim", 0.0),
+                ),
+                reverse=True,
+            )
+            candidates.extend(ranked[:_TOP_K_CONTEXTS_PER_PAIR])
+
         return candidates
+
+    def _context_quality_score(
+        self,
+        context: str,
+        same_sentence: bool,
+        sent_distance: int,
+        offset_distance: int,
+        embed_sim: float,
+    ) -> float:
+        """Heuristic ranking score used to retain top-k contexts per pair."""
+        marker_hits = sum(1 for markers in _MARKERS.values() for marker in markers if marker in context)
+        marker_signal = min(1.0, marker_hits / 4.0)
+
+        same_sent_score = 1.0 if same_sentence else 0.0
+        sent_proximity = max(0.0, 1.0 - (sent_distance / max(1, _MAX_SENT_DISTANCE + 1)))
+        offset_proximity = max(0.0, 1.0 - (offset_distance / max(1, _MAX_OFFSET_DISTANCE)))
+
+        return float(
+            0.30 * same_sent_score
+            + 0.25 * embed_sim
+            + 0.20 * sent_proximity
+            + 0.15 * offset_proximity
+            + 0.10 * marker_signal
+        )
+
+    def _aggregate_relation_evidence(self, evidence: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Aggregate multiple context-level predictions for the same relation key.
+
+        Confidence uses noisy-or aggregation:
+            1 - ∏(1 - p_i)
+        """
+        if len(evidence) == 1:
+            rel = dict(evidence[0])
+            rel["evidence_count"] = 1
+            rel["contexts"] = [rel.get("context", "")]
+            return rel
+
+        best = max(evidence, key=lambda r: r.get("confidence", 0.0))
+
+        confidences = [max(0.0, min(1.0, float(r.get("confidence", 0.0)))) for r in evidence]
+        complement_prod = 1.0
+        for c in confidences:
+            complement_prod *= (1.0 - c)
+        agg_conf = 1.0 - complement_prod
+
+        score_keys = [REL_IS_A, REL_PART_OF, REL_CAUSE, REL_RELATED]
+        agg_feature_scores: Dict[str, float] = {}
+        for key in score_keys:
+            vals = [float(r.get("feature_scores", {}).get(key, 0.0)) for r in evidence]
+            agg_feature_scores[key] = round(sum(vals) / max(1, len(vals)), 4)
+
+        contexts: List[str] = []
+        for rel in evidence:
+            ctx = str(rel.get("context", "")).strip()
+            if ctx and ctx not in contexts:
+                contexts.append(ctx)
+
+        merged = dict(best)
+        merged["confidence"] = round(float(min(1.0, agg_conf)), 4)
+        merged["direction_score"] = round(float(max(r.get("direction_score", 0.0) for r in evidence)), 4)
+        merged["directed"] = merged["direction_score"] > 0.60
+        merged["feature_scores"] = agg_feature_scores
+        merged["evidence_count"] = len(evidence)
+        merged["contexts"] = contexts[:_TOP_K_CONTEXTS_PER_PAIR]
+        return merged
 
     # =========================================================================
     # Stage 2 – Feature extraction + classification
@@ -617,43 +1068,8 @@ class RelationClassifier:
         entity_embs = pair.get("_entity_embs")
         i, j = pair["e1_emb_idx"], pair["e2_emb_idx"]
 
-        # ── Extract text between the two entities in the context sentence ────
-        between = self._between_text(e1["text"], e2["text"], context)
-
-        # ── Lexical marker features ───────────────────────────────────────────
-        lex_between = self._marker_scores(between)
-        lex_context = self._marker_scores(context)
-
-        # ── Embedding features ────────────────────────────────────────────────
-        embed_sim = float(pair.get("embed_sim", 0.50))
-
-        between_type_sims = self._between_type_similarities(between)
-
-        # ── Structural features ───────────────────────────────────────────────
-        same_sent = 1.0 if pair["same_sentence"] else 0.0
-        dist_norm = max(0.0, 1.0 - pair["offset_distance"] / _MAX_OFFSET_DISTANCE)
-
-        # ── Assemble 14-dim feature vector ────────────────────────────────────
-        feat = np.array([
-            lex_between[REL_IS_A],      # [0]
-            lex_between[REL_PART_OF],   # [1]
-            lex_between[REL_CAUSE],     # [2]
-            lex_between[REL_RELATED],   # [3]
-            lex_context[REL_IS_A],      # [4]
-            lex_context[REL_PART_OF],   # [5]
-            lex_context[REL_CAUSE],     # [6]
-            lex_context[REL_RELATED],   # [7]
-            embed_sim,                  # [8]
-            between_type_sims[REL_IS_A],    # [9]
-            between_type_sims[REL_PART_OF], # [10]
-            between_type_sims[REL_CAUSE],   # [11]
-            same_sent,                  # [12]
-            dist_norm,                  # [13]
-        ], dtype=np.float64)
-
-        # ── Softmax score per type ────────────────────────────────────────────
-        logits = _WEIGHT_MATRIX @ feat + _BIAS        # shape (4,)
-        probs = _softmax(logits)                       # shape (4,)
+        feat, between = self._extract_feature_vector(pair)
+        probs = self._predict_probs(feat)
 
         best_idx = int(np.argmax(probs))
         rel_type = CANONICAL_TYPES[best_idx]
@@ -673,6 +1089,7 @@ class RelationClassifier:
             "source": source,
             "target": target,
             "type": rel_type,
+            "relation_family": "semantic_relatedness" if rel_type == REL_RELATED else "logical_relation",
             "confidence": round(confidence, 4),
             "direction_score": round(dir_score, 4),
             "directed": dir_score > 0.60,
@@ -683,7 +1100,175 @@ class RelationClassifier:
                 REL_CAUSE:   round(float(probs[2]), 4),
                 REL_RELATED: round(float(probs[3]), 4),
             },
+            "model_source": "trained" if self._trained_model is not None else "fallback",
         }
+
+    def _extract_feature_vector(self, pair: Dict[str, Any]) -> Tuple[np.ndarray, str]:
+        e1: Dict = pair["e1"]
+        e2: Dict = pair["e2"]
+        context: str = pair["context"]
+
+        between = self._between_text(e1["text"], e2["text"], context)
+
+        lex_between = self._marker_scores(between)
+        lex_context = self._marker_scores(context)
+
+        embed_sim = float(pair.get("embed_sim", 0.50))
+        between_type_sims = self._between_type_similarities(between)
+
+        same_sent = 1.0 if pair["same_sentence"] else 0.0
+        dist_norm = max(0.0, 1.0 - pair["offset_distance"] / _MAX_OFFSET_DISTANCE)
+
+        marker_hits_between = sum(1 for markers in _MARKERS.values() for m in markers if m in between)
+        between_token_count = max(1, len(between.split()))
+        marker_density = min(1.0, marker_hits_between / (between_token_count * 2.5))
+
+        morph = self._morph_feature_vector(e1["text"], e2["text"], between)
+        directionality = self._directionality_feature_vector(between)
+
+        feat = np.array([
+            lex_between[REL_IS_A],
+            lex_between[REL_PART_OF],
+            lex_between[REL_CAUSE],
+            lex_between[REL_RELATED],
+            lex_context[REL_IS_A],
+            lex_context[REL_PART_OF],
+            lex_context[REL_CAUSE],
+            lex_context[REL_RELATED],
+            embed_sim,
+            between_type_sims[REL_IS_A],
+            between_type_sims[REL_PART_OF],
+            between_type_sims[REL_CAUSE],
+            same_sent,
+            dist_norm,
+            marker_density,
+            morph["root_match"],
+            morph["inflected_match"],
+            morph["e1_case_suffix"],
+            morph["e2_case_suffix"],
+            morph["between_connector"],
+            directionality["cue_position"],
+            directionality["dependency_like_distance"],
+            directionality["clause_boundary"],
+        ], dtype=np.float64)
+        return feat, between
+
+    def _morph_feature_vector(self, e1_text: str, e2_text: str, between: str) -> Dict[str, float]:
+        root1 = normalize_sinhala_word(e1_text)
+        root2 = normalize_sinhala_word(e2_text)
+        root_match = 1.0 if root1 and root2 and root1 == root2 else 0.0
+
+        inflected_match = 1.0 if self._morph.is_inflected_form(e1_text, e2_text) else 0.0
+
+        case_suffixes = tuple(self._morph.case_suffixes)
+        e1_case = 1.0 if any(e1_text.endswith(sfx) for sfx in case_suffixes) else 0.0
+        e2_case = 1.0 if any(e2_text.endswith(sfx) for sfx in case_suffixes) else 0.0
+
+        connector_tokens = ("සහ", "හා", "මෙන්ම", "සමඟ", "එක්ව")
+        between_connector = 1.0 if any(tok in between for tok in connector_tokens) else 0.0
+
+        return {
+            "root_match": root_match,
+            "inflected_match": inflected_match,
+            "e1_case_suffix": e1_case,
+            "e2_case_suffix": e2_case,
+            "between_connector": between_connector,
+        }
+
+    def _directionality_feature_vector(self, between: str) -> Dict[str, float]:
+        span = f" {between.strip()} " if between else " "
+        span_clean = between.strip()
+
+        cue_position = 0.5
+        if span_clean:
+            cue_hits: List[Tuple[int, int]] = []
+            for cue in _DIRECTIONALITY_CUES:
+                idx = span_clean.find(cue)
+                if idx >= 0:
+                    cue_hits.append((idx, len(cue)))
+            if cue_hits:
+                cue_idx, cue_len = min(cue_hits, key=lambda x: x[0])
+                cue_center = cue_idx + (cue_len / 2.0)
+                cue_position = float(np.clip(cue_center / max(1.0, float(len(span_clean))), 0.0, 1.0))
+
+        clause_boundary = 1.0 if any(marker in span for marker in _CLAUSE_BOUNDARY_MARKERS) else 0.0
+        clause_penalty = sum(1 for marker in _CLAUSE_BOUNDARY_MARKERS if marker in span)
+
+        token_gap = len([tok for tok in re.split(r"\s+", span_clean) if tok])
+        dependency_steps = token_gap + (2 * clause_penalty)
+        dependency_like_distance = max(0.0, 1.0 - min(dependency_steps, 20) / 20.0)
+
+        return {
+            "cue_position": cue_position,
+            "dependency_like_distance": dependency_like_distance,
+            "clause_boundary": clause_boundary,
+        }
+
+    def build_training_samples(
+        self,
+        text: str,
+        entities: List[Dict[str, Any]],
+        labels: Dict[Tuple[str, str], str],
+        include_unlabeled_as_related: bool = True,
+        max_unlabeled_ratio: float = 1.0,
+    ) -> Tuple[List[np.ndarray], List[str]]:
+        """
+        Build feature vectors and labels from one annotated text instance.
+
+        Parameters
+        ----------
+        text : str
+            Source text.
+        entities : List[Dict]
+            Entity dicts containing at least ``text`` and ``offset``.
+        labels : Dict[(source_text, target_text), relation_type]
+            Directed relation labels.
+        include_unlabeled_as_related : bool
+            Whether unlabeled candidate pairs should be treated as ``related-to``.
+        max_unlabeled_ratio : float
+            Maximum unlabeled samples per labeled sample.
+        """
+        if len(entities) < 2:
+            return [], []
+
+        sentences = self.engine._split_sentences_with_spans(text)
+        profile = self.engine.assess_text_bucket(text)
+        candidate_gates = self._calibrate_candidate_gates(
+            profile.get("domain", "society"),
+            profile.get("noise_bucket", "medium"),
+        )
+        candidates = self._generate_candidates(entities, sentences, text, candidate_gates)
+
+        X: List[np.ndarray] = []
+        y: List[str] = []
+        unlabeled_kept = 0
+        labeled_count = 0
+
+        for pair in candidates:
+            e1 = pair["e1"]["text"]
+            e2 = pair["e2"]["text"]
+
+            label = labels.get((e1, e2))
+            if label is None:
+                label = labels.get((e2, e1))
+
+            if label is None and include_unlabeled_as_related:
+                allowed_unlabeled = max(1, int(max_unlabeled_ratio * max(labeled_count, 1)))
+                if unlabeled_kept >= allowed_unlabeled:
+                    continue
+                label = REL_RELATED
+                unlabeled_kept += 1
+
+            if label is None:
+                continue
+
+            feat, _ = self._extract_feature_vector(pair)
+            X.append(feat)
+            y.append(label)
+            if (e1, e2) in labels or (e2, e1) in labels:
+                labeled_count += 1
+
+        return X, y
 
     # =========================================================================
     # Feature helpers

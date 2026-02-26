@@ -31,7 +31,7 @@ class IntelligentMindMapGenerator:
         self.default_max_nodes = getattr(Config, 'MAX_NODES', 50)
         self.default_semantic_clustering = getattr(Config, 'SEMANTIC_CLUSTERING', True)
         self.graph_constraints = GraphConstraints()
-        self.max_nodes_per_level = {
+        self.base_nodes_per_level = {
             0: 1,   # Root
             1: 6,   # Main topics
             2: 12,  # Subtopics
@@ -96,10 +96,19 @@ class IntelligentMindMapGenerator:
         # Step 4b: Extract structured enumerations (phases, examples, requirements)
         enumerations = self.nlp_engine.extract_enumerations(text)
         logger.info(f"Found {len(enumerations)} enumerations")
+
+        # Step 4c: Dynamic node limits based on essay complexity
+        node_limits = self._compute_dynamic_node_limits(
+            text=text,
+            entities=entities,
+            key_phrases=key_phrases,
+            max_nodes=max_nodes,
+        )
+        logger.info(f"Dynamic node limits: {node_limits}")
         
         # Step 5: Build hierarchical graph structure
         nodes, edges = self._build_intelligent_graph(
-            text, entities, key_phrases, clusters, relationships, max_nodes, cluster_map
+            text, entities, key_phrases, clusters, relationships, max_nodes, cluster_map, node_limits
         )
 
         # Step 5b: Inject structured enumeration nodes and edges
@@ -140,8 +149,17 @@ class IntelligentMindMapGenerator:
         #   4. Drop weak cross-cluster soft edges
         nodes, edges = self.graph_constraints.apply(nodes, edges, cluster_map)
 
+        # Step 6e: Coherence-aware pruning for soft cross-level spaghetti edges
+        edges = self._prune_spaghetti_edges(nodes, edges)
+
         # Step 7: Assign deterministic positions for better layouts
         nodes = self._assign_positions(nodes)
+
+        coherence_metrics = self._compute_graph_coherence(nodes, edges)
+        sentence_count = max(1, len(self.nlp_engine._split_sentences_with_spans(text)))
+        quality_metrics = self._compute_quality_metrics(text, nodes, edges, coherence_metrics, sentence_count)
+        confidence_distribution = self._compute_confidence_distribution(nodes, edges)
+        low_confidence_explanations = self._build_low_confidence_explanations(nodes, edges)
         
         logger.info(f"Generated graph with {len(nodes)} nodes and {len(edges)} edges")
         
@@ -155,6 +173,13 @@ class IntelligentMindMapGenerator:
                 'relationships_found': len(relationships),
                 'clusters': len(clusters),
                 'text_length': len(text),
+                'coherence': coherence_metrics,
+                'quality': quality_metrics,
+                'confidence_distribution': confidence_distribution,
+                'semantic_density': quality_metrics.get('semantic_density', 0.0),
+                'semantic_coverage': quality_metrics.get('semantic_coverage', 0.0),
+                'redundancy': quality_metrics.get('redundancy', 0.0),
+                'low_confidence_explanations': low_confidence_explanations,
                 'intelligence_level': 'advanced'
             }
         }
@@ -167,7 +192,8 @@ class IntelligentMindMapGenerator:
         clusters: List[List[Dict]],
         relationships: List[Dict],
         max_nodes: int,
-        cluster_map: Dict[str, int]
+        cluster_map: Dict[str, int],
+        node_limits: Dict[int, int]
     ) -> Tuple[List[Dict], List[Dict]]:
         """Build the graph structure intelligently."""
         nodes = []
@@ -200,7 +226,7 @@ class IntelligentMindMapGenerator:
         # Branch colors for visual distinction
         branch_colors = ['#4ECDC4', '#95E1D3', '#F38181', '#FFA07A', '#98D8C8']
         
-        for i, node_data in enumerate(level1_nodes[:self.max_nodes_per_level[1]]):
+        for i, node_data in enumerate(level1_nodes[:node_limits[1]]):
             node_id = self._generate_id()
             # Keep label clean but preserve meaning
             cleaned_label = self._clean_label_preserving(node_data['text'])
@@ -231,7 +257,7 @@ class IntelligentMindMapGenerator:
         level2_candidates = [e for e in entities if e['text'] not in node_map]
         level2_nodes = sorted(level2_candidates, key=lambda x: (-(x.get('importance', 0)), x.get('offset', 0)))
         
-        for entity in level2_nodes[:self.max_nodes_per_level[2]]:
+        for entity in level2_nodes[:node_limits[2]]:
             node_id = self._generate_id()
             # Preserve label integrity for subtopics
             cleaned_label = self._clean_label_preserving(entity['text'])
@@ -276,7 +302,7 @@ class IntelligentMindMapGenerator:
             if phrase not in node_map
         ]
         
-        for item in level3_candidates[:self.max_nodes_per_level[3]]:
+        for item in level3_candidates[:node_limits[3]]:
             if len(nodes) >= max_nodes:
                 break
             
@@ -312,8 +338,9 @@ class IntelligentMindMapGenerator:
         # correct orientation from the relation classifier is preserved.
         # When the reverse orientation of the same type was already seen
         # we keep whichever has the higher direction_score.
+        scored_relationships = self._rebalance_relationship_edges_for_scoring(relationships)
         edge_keys: Dict[tuple, Dict] = {}
-        for rel in relationships:
+        for rel in scored_relationships:
             source_id = node_map.get(rel['source'])
             target_id = node_map.get(rel['target'])
 
@@ -321,13 +348,22 @@ class IntelligentMindMapGenerator:
                 fwd_key = (source_id, target_id, rel['type'])
                 rev_key = (target_id, source_id, rel['type'])
                 new_dir = rel.get('direction_score', 0.5)
+                rel_conf = float(rel.get('confidence', 0.0))
+                is_semantic = rel.get('type') == 'related-to'
+                edge_score = rel_conf * (0.82 if is_semantic else 1.0)
+                edge_weight = max(1, int((edge_score if not is_semantic else edge_score * 0.9) * 3))
                 edge_dict = {
                     'id': self._generate_id(),
                     'source': source_id,
                     'target': target_id,
                     'type': rel['type'],
-                    'weight': max(1, int(rel['confidence'] * 3)),
-                    'confidence': rel['confidence'],
+                    'weight': edge_weight,
+                    'confidence': rel_conf,
+                    'edge_score': round(edge_score, 4),
+                    'relation_family': rel.get(
+                        'relation_family',
+                        'semantic_relatedness' if is_semantic else 'logical_relation'
+                    ),
                     'direction_score': new_dir,
                     'directed': rel.get('directed', False),
                 }
@@ -337,12 +373,43 @@ class IntelligentMindMapGenerator:
                         del edge_keys[rev_key]
                         edge_keys[fwd_key] = edge_dict
                 elif fwd_key not in edge_keys or \
-                        rel['confidence'] > edge_keys[fwd_key]['confidence']:
+                    edge_score > edge_keys[fwd_key].get('edge_score', edge_keys[fwd_key].get('confidence', 0.0)):
                     edge_keys[fwd_key] = edge_dict
 
         edges.extend(edge_keys.values())
         
         return nodes, edges
+
+    def _rebalance_relationship_edges_for_scoring(self, relationships: List[Dict]) -> List[Dict]:
+        """
+        Separate logical relations from semantic relatedness and cap soft
+        semantic edges so they do not dominate graph connectivity.
+        """
+        if not relationships:
+            return []
+
+        logical = sorted(
+            [r for r in relationships if r.get('type') != 'related-to'],
+            key=lambda r: float(r.get('confidence', 0.0)),
+            reverse=True,
+        )
+        semantic = sorted(
+            [r for r in relationships if r.get('type') == 'related-to'],
+            key=lambda r: float(r.get('confidence', 0.0)),
+            reverse=True,
+        )
+
+        if not semantic:
+            return logical
+
+        if not logical:
+            semantic_cap = min(len(semantic), 6)
+        else:
+            semantic_cap = min(len(semantic), len(logical) + 2)
+
+        selected = logical + semantic[:semantic_cap]
+        selected.sort(key=lambda r: float(r.get('confidence', 0.0)), reverse=True)
+        return selected
 
     def _apply_enumeration_structure(
         self,
@@ -383,6 +450,8 @@ class IntelligentMindMapGenerator:
             head_label = self.nlp_engine.clean_label(enum.get('head') or '') if enum.get('head') else None
             items = [self.nlp_engine.clean_label(i) for i in enum.get('items', [])]
             items = [i for i in items if i]
+            nested_items = enum.get('nested_items', {}) or {}
+            enum_confidence = float(enum.get('confidence', 0.58))
             if len(items) < 2:
                 continue
 
@@ -414,13 +483,35 @@ class IntelligentMindMapGenerator:
                 edge_type = 'example_of' if relation == 'example' else 'phase'
                 if relation == 'requires':
                     edge_type = 'requires'
+                elif relation == 'comparison':
+                    edge_type = 'compares'
+                elif relation == 'argument':
+                    edge_type = 'argues'
+                elif relation == 'group':
+                    edge_type = 'includes'
                 edges.append({
                     'id': self._generate_id(),
                     'source': head_id,
                     'target': item_id,
                     'type': edge_type,
-                    'weight': 2
+                    'weight': 2,
+                    'confidence': enum_confidence,
                 })
+
+                child_items = [self.nlp_engine.clean_label(c) for c in nested_items.get(item, [])]
+                child_items = [c for c in child_items if c]
+                for child in child_items:
+                    child_id = ensure_node(child, min(level + 1, 3), 'detail', 14, 'enumeration_nested_item')
+                    if not child_id:
+                        continue
+                    edges.append({
+                        'id': self._generate_id(),
+                        'source': item_id,
+                        'target': child_id,
+                        'type': 'subitem_of',
+                        'weight': 1,
+                        'confidence': max(0.42, enum_confidence - 0.08),
+                    })
 
                 if relation == 'sequence' and previous_id:
                     edges.append({
@@ -428,7 +519,8 @@ class IntelligentMindMapGenerator:
                         'source': previous_id,
                         'target': item_id,
                         'type': 'followed_by',
-                        'weight': 1
+                        'weight': 1,
+                        'confidence': max(0.45, enum_confidence - 0.05),
                     })
                 previous_id = item_id
 
@@ -477,41 +569,36 @@ class IntelligentMindMapGenerator:
         entities: List[Dict],
         key_phrases: List[Tuple[str, float]]
     ) -> str:
-        """Determine the root topic for the mind map."""
-        # Prefer the FIRST entity (usually the main subject) in the first sentence
+        """Determine root topic using topic-sentence and subject salience scoring."""
         if entities:
-            text_len = max(1, len(text))
-            # Focus on entities in first 25% of text
-            first_sentence_end = text.find('.') if '.' in text else int(text_len * 0.25)
-            early_entities = [
-                e for e in entities
-                if e.get('offset', text_len) <= first_sentence_end
-            ]
-            if early_entities:
-                # Sort by offset first (earlier = better), then importance
-                early_entities.sort(key=lambda x: (x.get('offset', 0), -(x.get('importance', 0))))
-                # Prefer proper nouns or location types
-                for e in early_entities[:3]:
-                    if e.get('type') in ['proper_noun', 'location', 'concept']:
-                        return e['text']
-                return early_entities[0]['text']
-            entities.sort(key=lambda x: (x.get('offset', 0), -(x.get('importance', 0))))
-            return entities[0]['text']
+            sentences = self.nlp_engine._split_sentences_with_spans(text)
+            topic_candidates = self._detect_topic_sentence_entities(sentences, entities)
+            if topic_candidates:
+                return topic_candidates[0]['text']
 
-        # Try to extract from first sentence
-        first_sentence = text.split('.')[0].strip()
-        if first_sentence and len(first_sentence) < 100:
-            # Extract first meaningful noun phrase
-            words = first_sentence.split()
-            if len(words) >= 2:
-                return ' '.join(words[:2])
-            return self._truncate_text(first_sentence, 80)
-        
-        # Use top key phrase
+            # Fallback: pick globally salient main subject, not just first mention
+            scored = []
+            text_len = max(1, len(text))
+            for e in entities:
+                importance = float(e.get('importance', 0.0))
+                offset = float(e.get('offset', text_len))
+                position_score = max(0.0, 1.0 - (offset / text_len))
+                type_bonus = 0.15 if e.get('type') in {'concept', 'proper_noun', 'location'} else 0.0
+                freq_bonus = min(0.2, (text.count(e.get('text', '')) - 1) * 0.05)
+                salience = (0.55 * importance) + (0.25 * position_score) + type_bonus + freq_bonus
+                scored.append((salience, e))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            if scored:
+                return scored[0][1]['text']
+
         if key_phrases:
             return key_phrases[0][0]
-        
-        # Fallback to first 80 characters
+
+        first_sentence = (text.split('.')[0] if '.' in text else text[:120]).strip()
+        if first_sentence:
+            words = first_sentence.split()
+            return ' '.join(words[:2]) if len(words) >= 2 else self._truncate_text(first_sentence, 80)
         return self._truncate_text(text, 80)
     
     def _find_best_parent(
@@ -694,50 +781,382 @@ class IntelligentMindMapGenerator:
 
     def _deduplicate_edges(self, edges: List[Dict]) -> List[Dict]:
         """
-        Ensure only ONE edge exists between any two nodes.
-        Keeps the most important edge based on type priority and weight.
+        Deduplicate exact duplicate edges while preserving valid parallel relations.
+
+        Keeps one edge per (source, target, type) signature. This avoids
+        over-deduplication that previously removed meaningful parallel edges
+        between the same two nodes with different relation types.
         """
         if not edges:
             return edges
-        
-        # Priority: hierarchy > semantic > other types
-        type_priority = {
-            'hierarchy': 10,
-            'semantic': 5,
-            'semantic_cross': 4,
-            'proximity': 3,
-            'close': 2,
-            'conjunction': 2,
-            'action': 2
-        }
-        
-        # Group edges by node pairs (undirected)
-        edge_groups = {}
+
+        grouped: Dict[Tuple[str, str, str], List[Dict]] = defaultdict(list)
         for edge in edges:
-            source = edge['source']
-            target = edge['target']
-            # Create canonical key (sorted to handle both directions)
-            pair_key = tuple(sorted([source, target]))
-            
-            if pair_key not in edge_groups:
-                edge_groups[pair_key] = []
-            edge_groups[pair_key].append(edge)
-        
-        # For each pair, keep only the best edge
-        deduplicated = []
-        for pair_key, pair_edges in edge_groups.items():
-            if len(pair_edges) == 1:
-                deduplicated.append(pair_edges[0])
-            else:
-                # Score each edge and keep the best
-                best_edge = max(pair_edges, key=lambda e: (
-                    type_priority.get(e.get('type', ''), 1),
+            key = (edge.get('source'), edge.get('target'), edge.get('type', ''))
+            grouped[key].append(edge)
+
+        deduplicated: List[Dict] = []
+        for same_edges in grouped.values():
+            if len(same_edges) == 1:
+                deduplicated.append(same_edges[0])
+                continue
+            best = max(
+                same_edges,
+                key=lambda e: (
                     e.get('weight', 1),
-                    e.get('confidence', 0.5)
-                ))
-                deduplicated.append(best_edge)
-        
+                    e.get('confidence', 0.5),
+                    e.get('direction_score', 0.5),
+                ),
+            )
+            deduplicated.append(best)
+
         return deduplicated
+
+    def _compute_dynamic_node_limits(
+        self,
+        text: str,
+        entities: List[Dict],
+        key_phrases: List[Tuple[str, float]],
+        max_nodes: int,
+    ) -> Dict[int, int]:
+        """Set level-wise node limits dynamically from essay complexity."""
+        text_len = len(text)
+        sentence_count = max(1, len(self.nlp_engine._split_sentences_with_spans(text)))
+        entity_density = len(entities) / sentence_count
+        phrase_density = len(key_phrases) / sentence_count
+
+        complexity = 0.0
+        complexity += min(1.0, text_len / 1600.0) * 0.40
+        complexity += min(1.0, entity_density / 4.0) * 0.35
+        complexity += min(1.0, phrase_density / 3.0) * 0.25
+
+        budget = max(12, min(max_nodes, int(max_nodes * (0.60 + 0.40 * complexity))))
+        level1 = max(4, int(budget * 0.22))
+        level2 = max(6, int(budget * 0.40))
+        level3 = max(6, budget - 1 - level1 - level2)
+
+        return {
+            0: 1,
+            1: min(level1, 12),
+            2: min(level2, 24),
+            3: min(level3, 32),
+        }
+
+    def _detect_topic_sentence_entities(
+        self,
+        sentences: List[Tuple[str, int]],
+        entities: List[Dict],
+    ) -> List[Dict]:
+        """Return likely main-subject entities from topic sentences."""
+        if not sentences or not entities:
+            return []
+
+        candidate_spans = sentences[: min(3, len(sentences))]
+        topic_markers = ('යනු', 'වන්නේ', 'මෙම', 'මෙය', 'අර්ථයෙන්', 'සඳහා', 'විෂය')
+        selected: List[Dict] = []
+
+        for sent_text, sent_start in candidate_spans:
+            sent_end = sent_start + len(sent_text)
+            sentence_bonus = 0.15 if any(m in sent_text for m in topic_markers) else 0.0
+
+            in_sentence = [
+                e for e in entities
+                if sent_start <= e.get('offset', -1) < sent_end
+            ]
+            for e in in_sentence:
+                importance = float(e.get('importance', 0.0))
+                offset_local = max(0, e.get('offset', sent_start) - sent_start)
+                locality = max(0.0, 1.0 - (offset_local / max(1, len(sent_text))))
+                score = (0.65 * importance) + (0.20 * locality) + sentence_bonus
+                selected.append({**e, '_topic_score': score})
+
+        selected.sort(key=lambda x: x.get('_topic_score', 0.0), reverse=True)
+        return selected
+
+    def _prune_spaghetti_edges(self, nodes: List[Dict], edges: List[Dict]) -> List[Dict]:
+        """Aggressively prune weak soft cross-level edges and high-degree clutter."""
+        if not edges:
+            return edges
+
+        node_level = {n['id']: n.get('level', 0) for n in nodes}
+        soft_types = {'semantic', 'semantic_cross', 'proximity', 'related-to', 'conjunction', 'close'}
+
+        filtered: List[Dict] = []
+        soft_out_degree: Dict[str, int] = defaultdict(int)
+
+        for e in edges:
+            etype = e.get('type', '')
+            src, tgt = e.get('source'), e.get('target')
+            l_src = node_level.get(src, 0)
+            l_tgt = node_level.get(tgt, 0)
+            level_gap = abs(l_src - l_tgt)
+            conf = float(e.get('confidence', 0.5))
+            weight = float(e.get('weight', 1))
+
+            if etype in soft_types:
+                if level_gap >= 2 and conf < 0.72:
+                    continue
+                if level_gap >= 1 and conf < 0.62 and weight <= 1:
+                    continue
+                if soft_out_degree[src] >= 3:
+                    continue
+                soft_out_degree[src] += 1
+
+            filtered.append(e)
+
+        return filtered
+
+    def _compute_graph_coherence(self, nodes: List[Dict], edges: List[Dict]) -> Dict[str, float]:
+        """Compute graph quality metrics for connectivity and depth balance."""
+        if not nodes:
+            return {
+                'connectivity': 0.0,
+                'depth_balance': 0.0,
+                'cross_level_ratio': 0.0,
+                'avg_degree': 0.0,
+                'coherence_score': 0.0,
+            }
+
+        node_ids = [n['id'] for n in nodes]
+        id_set = set(node_ids)
+        adj: Dict[str, List[str]] = defaultdict(list)
+        degree: Dict[str, int] = defaultdict(int)
+        cross_level = 0
+
+        levels = {n['id']: n.get('level', 0) for n in nodes}
+        for e in edges:
+            s, t = e.get('source'), e.get('target')
+            if s not in id_set or t not in id_set:
+                continue
+            adj[s].append(t)
+            adj[t].append(s)
+            degree[s] += 1
+            degree[t] += 1
+            if levels.get(s, 0) != levels.get(t, 0):
+                cross_level += 1
+
+        # Connectivity: fraction of nodes reachable from root (or first node)
+        root_id = next((n['id'] for n in nodes if n.get('level') == 0), node_ids[0])
+        visited = set()
+        stack = [root_id]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            stack.extend(adj.get(cur, []))
+        connectivity = len(visited) / max(1, len(nodes))
+
+        # Depth balance: reward spread across levels without extreme skew
+        level_counts: Dict[int, int] = defaultdict(int)
+        for n in nodes:
+            level_counts[n.get('level', 0)] += 1
+        counts = list(level_counts.values())
+        mean_count = sum(counts) / max(1, len(counts))
+        variance = sum((c - mean_count) ** 2 for c in counts) / max(1, len(counts))
+        depth_balance = 1.0 / (1.0 + variance / max(1.0, mean_count))
+
+        cross_level_ratio = cross_level / max(1, len(edges))
+        avg_degree = sum(degree.values()) / max(1, len(nodes))
+        coherence_score = (
+            (0.45 * connectivity)
+            + (0.30 * depth_balance)
+            + (0.15 * max(0.0, 1.0 - cross_level_ratio))
+            + (0.10 * min(1.0, avg_degree / 2.5))
+        )
+
+        return {
+            'connectivity': round(float(connectivity), 4),
+            'depth_balance': round(float(depth_balance), 4),
+            'cross_level_ratio': round(float(cross_level_ratio), 4),
+            'avg_degree': round(float(avg_degree), 4),
+            'coherence_score': round(float(coherence_score), 4),
+        }
+
+    def _compute_quality_metrics(
+        self,
+        text: str,
+        nodes: List[Dict],
+        edges: List[Dict],
+        coherence_metrics: Dict[str, float],
+        sentence_count: int,
+    ) -> Dict[str, float]:
+        """Compute high-level graph quality metrics: coherence, coverage, redundancy and semantic density."""
+        if not nodes:
+            return {
+                'coherence_score': 0.0,
+                'semantic_coverage': 0.0,
+                'redundancy': 0.0,
+                'semantic_density': 0.0,
+                'quality_score': 0.0,
+            }
+
+        non_root_nodes = [n for n in nodes if n.get('level', 0) > 0]
+        normalized_labels = [self.nlp_engine._normalize_term(n.get('label', '')) for n in non_root_nodes]
+        normalized_labels = [l for l in normalized_labels if l]
+
+        unique_labels = set(normalized_labels)
+        exact_redundancy = 1.0 - (len(unique_labels) / max(1, len(normalized_labels)))
+
+        # Additional overlap redundancy from high lexical overlap between node labels
+        overlap_pairs = 0
+        total_pairs = 0
+        for i in range(len(normalized_labels)):
+            a = set(normalized_labels[i].split())
+            if not a:
+                continue
+            for j in range(i + 1, len(normalized_labels)):
+                b = set(normalized_labels[j].split())
+                if not b:
+                    continue
+                total_pairs += 1
+                jacc = len(a & b) / max(1, len(a | b))
+                if jacc >= 0.8:
+                    overlap_pairs += 1
+
+        overlap_redundancy = (overlap_pairs / max(1, total_pairs)) if total_pairs else 0.0
+        redundancy = min(1.0, (0.7 * exact_redundancy) + (0.3 * overlap_redundancy))
+
+        # Semantic coverage: fraction of sentences represented by at least one graph concept label
+        sentence_spans = self.nlp_engine._split_sentences_with_spans(text)
+        represented_sentences = 0
+        for sent, _ in sentence_spans:
+            sent_norm = self.nlp_engine._normalize_unicode(sent)
+            hit = False
+            for label in unique_labels:
+                if label and label in sent_norm:
+                    hit = True
+                    break
+            if hit:
+                represented_sentences += 1
+
+        semantic_coverage = represented_sentences / max(1, sentence_count)
+        semantic_density = len(non_root_nodes) / max(1, sentence_count)
+
+        coherence_score = float(coherence_metrics.get('coherence_score', 0.0))
+
+        # Quality score prefers coherent, high-coverage, low-redundancy graphs
+        quality_score = (
+            (0.4 * coherence_score)
+            + (0.35 * semantic_coverage)
+            + (0.15 * min(1.0, semantic_density / 3.0))
+            + (0.10 * max(0.0, 1.0 - redundancy))
+        )
+
+        return {
+            'coherence_score': round(float(coherence_score), 4),
+            'semantic_coverage': round(float(semantic_coverage), 4),
+            'redundancy': round(float(redundancy), 4),
+            'semantic_density': round(float(semantic_density), 4),
+            'quality_score': round(float(quality_score), 4),
+        }
+
+    def _compute_confidence_distribution(self, nodes: List[Dict], edges: List[Dict]) -> Dict[str, Dict[str, float]]:
+        """Track confidence distribution across nodes and edges."""
+
+        def _stats(values: List[float]) -> Dict[str, float]:
+            if not values:
+                return {
+                    'min': 0.0,
+                    'max': 0.0,
+                    'mean': 0.0,
+                    'median': 0.0,
+                    'p10': 0.0,
+                    'p90': 0.0,
+                    'low_ratio': 0.0,
+                    'mid_ratio': 0.0,
+                    'high_ratio': 0.0,
+                }
+            vals = sorted(max(0.0, min(1.0, float(v))) for v in values)
+            n = len(vals)
+            mean = sum(vals) / n
+            median = vals[n // 2] if n % 2 == 1 else (vals[(n // 2) - 1] + vals[n // 2]) / 2.0
+            p10 = vals[max(0, int(0.10 * (n - 1)))]
+            p90 = vals[min(n - 1, int(0.90 * (n - 1)))]
+            low = sum(1 for v in vals if v < 0.45) / n
+            mid = sum(1 for v in vals if 0.45 <= v < 0.7) / n
+            high = sum(1 for v in vals if v >= 0.7) / n
+            return {
+                'min': round(float(vals[0]), 4),
+                'max': round(float(vals[-1]), 4),
+                'mean': round(float(mean), 4),
+                'median': round(float(median), 4),
+                'p10': round(float(p10), 4),
+                'p90': round(float(p90), 4),
+                'low_ratio': round(float(low), 4),
+                'mid_ratio': round(float(mid), 4),
+                'high_ratio': round(float(high), 4),
+            }
+
+        node_conf = [float(n.get('importance', 0.0)) for n in nodes if n.get('level', 0) > 0]
+        edge_conf = []
+        for e in edges:
+            if 'confidence' in e:
+                edge_conf.append(float(e.get('confidence', 0.0)))
+            else:
+                edge_conf.append(max(0.0, min(1.0, float(e.get('weight', 1)) / 3.0)))
+
+        return {
+            'nodes': _stats(node_conf),
+            'edges': _stats(edge_conf),
+        }
+
+    def _build_low_confidence_explanations(self, nodes: List[Dict], edges: List[Dict]) -> Dict[str, List[Dict[str, Any]]]:
+        """Generate explanations for low-confidence node/edge extractions."""
+        node_issues: List[Dict[str, Any]] = []
+        edge_issues: List[Dict[str, Any]] = []
+
+        for node in nodes:
+            if node.get('level', 0) == 0:
+                continue
+            conf = float(node.get('importance', 0.0))
+            if conf >= 0.45:
+                continue
+            source_type = node.get('source_type', 'unknown')
+            reason = 'Low salience in essay context'
+            if source_type == 'enumeration_item':
+                reason = 'Derived from list structure with limited semantic support'
+            elif source_type == 'phrase_extraction':
+                reason = 'Phrase prominence is below strong concept threshold'
+            elif source_type == 'subtopic':
+                reason = 'Subtopic has weak entity importance signal'
+            node_issues.append({
+                'id': node.get('id'),
+                'label': node.get('label'),
+                'confidence': round(conf, 4),
+                'reason': reason,
+                'suggestion': 'Review surrounding sentence or merge with a stronger related concept.'
+            })
+
+        for edge in edges:
+            conf = float(edge.get('confidence', max(0.0, min(1.0, float(edge.get('weight', 1)) / 3.0))))
+            if conf >= 0.5:
+                continue
+            edge_type = edge.get('type', 'related')
+            reason = 'Weak relation evidence between connected concepts'
+            if edge_type in {'semantic', 'related-to', 'proximity', 'conjunction', 'close'}:
+                reason = 'Similarity/proximity signal is weak and may be contextual noise'
+            elif edge_type in {'subitem_of', 'includes'}:
+                reason = 'List-derived link has limited context support'
+            edge_issues.append({
+                'id': edge.get('id'),
+                'type': edge_type,
+                'source': edge.get('source'),
+                'target': edge.get('target'),
+                'confidence': round(conf, 4),
+                'reason': reason,
+                'suggestion': 'Keep only if this relation is pedagogically meaningful.'
+            })
+
+        # Keep metadata compact while still informative
+        return {
+            'nodes': node_issues[:20],
+            'edges': edge_issues[:30],
+            'summary': {
+                'low_conf_nodes': len(node_issues),
+                'low_conf_edges': len(edge_issues),
+            }
+        }
 
     def _assign_positions(self, nodes: List[Dict]) -> List[Dict]:
         """Assign deterministic positions for nodes to make layouts stable per essay."""
@@ -829,6 +1248,25 @@ class IntelligentMindMapGenerator:
             'metadata': {
                 'total_nodes': 0,
                 'total_edges': 0,
+                'quality': {
+                    'coherence_score': 0.0,
+                    'semantic_coverage': 0.0,
+                    'redundancy': 0.0,
+                    'semantic_density': 0.0,
+                    'quality_score': 0.0,
+                },
+                'confidence_distribution': {
+                    'nodes': {},
+                    'edges': {},
+                },
+                'semantic_density': 0.0,
+                'semantic_coverage': 0.0,
+                'redundancy': 0.0,
+                'low_confidence_explanations': {
+                    'nodes': [],
+                    'edges': [],
+                    'summary': {'low_conf_nodes': 0, 'low_conf_edges': 0},
+                },
                 'intelligence_level': 'none'
             }
         }

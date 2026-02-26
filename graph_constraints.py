@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 MERGE_THRESHOLD: float = 0.82        # trigram-Jaccard above this → merge
 MAX_HIERARCHY_PARENTS: int = 2       # max incoming hierarchy edges per node
-CROSS_CLUSTER_MIN_CONF: float = 0.48 # minimum confidence for cross-cluster soft edges
+CROSS_CLUSTER_MIN_CONF: float = 0.58 # stricter minimum confidence for cross-cluster soft edges
 
 _HIERARCHY_TYPES: Set[str] = {'hierarchy', 'is-a', 'part-of'}
 _SOFT_TYPES: Set[str] = {
@@ -329,6 +329,8 @@ class GraphConstraints:
             if lbl in label_to_cluster
         }
 
+        id_to_level: Dict[str, int] = {n['id']: int(n.get('level', 0)) for n in nodes}
+
         retained: List[Dict[str, Any]] = []
         removed = 0
         for e in edges:
@@ -348,10 +350,12 @@ class GraphConstraints:
             if c_src != c_tgt:
                 # Cross-cluster: enforce the confidence floor
                 conf = e.get('confidence', 0.5)
-                if conf < CROSS_CLUSTER_MIN_CONF:
+                level_gap = abs(id_to_level.get(e['source'], 0) - id_to_level.get(e['target'], 0))
+                effective_floor = CROSS_CLUSTER_MIN_CONF + (0.08 if level_gap >= 2 else 0.0)
+                if conf < effective_floor:
                     logger.debug(
-                        "Cross-cluster '%s' edge dropped (conf=%.2f < %.2f)",
-                        etype, conf, CROSS_CLUSTER_MIN_CONF,
+                        "Cross-cluster '%s' edge dropped (conf=%.2f < %.2f, level_gap=%d)",
+                        etype, conf, effective_floor, level_gap,
                     )
                     removed += 1
                     continue
