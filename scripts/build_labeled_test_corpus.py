@@ -1,4 +1,5 @@
 import csv
+import argparse
 import json
 import re
 from collections import Counter
@@ -65,14 +66,47 @@ def _infer_relations(text: str, entities):
     return relations
 
 
-def build_corpus():
+def _build_bootstrap_record(i: int, row: dict):
+    entities = _extract_entities(row["text"], max_entities=8)
+    relations = _infer_relations(row["text"], entities)
+    return {
+        "id": f"student_{i:03d}",
+        "source": "student_essay",
+        "label_quality": "bootstrap_draft",
+        "annotation_status": "pending_human_review",
+        "text": row["text"],
+        "topic": row["topic"],
+        "expected_entities": [],
+        "expected_relations": [],
+        "draft_expected_entities": [e["text"] for e in entities],
+        "draft_expected_relations": relations,
+        "reviewer_notes": "",
+    }
+
+
+def _build_legacy_silver_record(i: int, row: dict):
+    entities = _extract_entities(row["text"], max_entities=8)
+    relations = _infer_relations(row["text"], entities)
+    return {
+        "id": f"student_{i:03d}",
+        "source": "student_essay",
+        "label_quality": "silver",
+        "text": row["text"],
+        "topic": row["topic"],
+        "expected_entities": [e["text"] for e in entities],
+        "expected_relations": relations,
+    }
+
+
+def build_corpus(emit_legacy_silver: bool = False):
     root = Path(__file__).resolve().parent.parent
     input_csvs = [
         root.parent / "scoring-model-training" / "sinhala_dataset_final_with_dyslexic.csv",
         root.parent / "scoring-model-training" / "sinhala_dataset_final.csv",
         root.parent / "scoring-model-training" / "akura_dataset.csv",
     ]
-    out_path = root / "tests" / "data" / "sinhala_student_essays_labeled_60.jsonl"
+    annotation_out_path = root / "tests" / "data" / "sinhala_student_essays_annotation_60.jsonl"
+    legacy_out_path = root / "tests" / "data" / "sinhala_student_essays_labeled_60.jsonl"
 
     rows = []
     for csv_path in input_csvs:
@@ -93,24 +127,31 @@ def build_corpus():
         uniq.setdefault(r["text"], r)
     rows = list(uniq.values())[:60]
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as out:
+    annotation_out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(annotation_out_path, "w", encoding="utf-8") as out:
         for i, row in enumerate(rows, start=1):
-            entities = _extract_entities(row["text"], max_entities=8)
-            relations = _infer_relations(row["text"], entities)
-            record = {
-                "id": f"student_{i:03d}",
-                "source": "student_essay",
-                "label_quality": "silver",
-                "text": row["text"],
-                "topic": row["topic"],
-                "expected_entities": [e["text"] for e in entities],
-                "expected_relations": relations,
-            }
+            record = _build_bootstrap_record(i, row)
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    print(f"Wrote {len(rows)} labeled essays -> {out_path}")
+    if emit_legacy_silver:
+        with open(legacy_out_path, "w", encoding="utf-8") as out:
+            for i, row in enumerate(rows, start=1):
+                record = _build_legacy_silver_record(i, row)
+                out.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    print(f"Wrote {len(rows)} annotation bootstrap essays -> {annotation_out_path}")
+    if emit_legacy_silver:
+        print(f"Wrote {len(rows)} legacy silver essays -> {legacy_out_path}")
+    else:
+        print("Legacy silver output skipped. Use --emit-legacy-silver only for backward compatibility.")
 
 
 if __name__ == "__main__":
-    build_corpus()
+    parser = argparse.ArgumentParser(description="Build annotation-assisted Sinhala essay corpus bootstrap")
+    parser.add_argument(
+        "--emit-legacy-silver",
+        action="store_true",
+        help="Also emit the old heuristic silver-labeled file for backward compatibility",
+    )
+    args = parser.parse_args()
+    build_corpus(emit_legacy_silver=args.emit_legacy_silver)

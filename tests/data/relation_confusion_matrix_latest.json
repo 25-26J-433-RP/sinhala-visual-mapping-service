@@ -1,0 +1,80 @@
+{
+  "docs_evaluated": 24,
+  "relation_types": [
+    "is-a",
+    "part-of",
+    "cause-effect",
+    "related-to"
+  ],
+  "metrics": {
+    "is-a": {
+      "support": 30,
+      "tp": 0,
+      "fp": 1,
+      "precision": 0.0,
+      "precision_floor": 0.05,
+      "effective_precision_floor": 0.05
+    },
+    "part-of": {
+      "support": 7,
+      "tp": 0,
+      "fp": 521,
+      "precision": 0.0,
+      "precision_floor": 0.05,
+      "effective_precision_floor": 0.0
+    },
+    "cause-effect": {
+      "support": 5,
+      "tp": 0,
+      "fp": 4,
+      "precision": 0.0,
+      "precision_floor": 0.01,
+      "effective_precision_floor": 0.0
+    },
+    "related-to": {
+      "support": 126,
+      "tp": 0,
+      "fp": 7,
+      "precision": 0.0,
+      "precision_floor": 0.04,
+      "effective_precision_floor": 0.04
+    }
+  },
+  "confusion_matrix": {
+    "__none__": {
+      "__none__": 0,
+      "is-a": 1,
+      "part-of": 514,
+      "cause-effect": 2,
+      "related-to": 7
+    },
+    "is-a": {
+      "__none__": 26,
+      "is-a": 0,
+      "part-of": 3,
+      "cause-effect": 1,
+      "related-to": 0
+    },
+    "part-of": {
+      "__none__": 7,
+      "is-a": 0,
+      "part-of": 0,
+      "cause-effect": 0,
+      "related-to": 0
+    },
+    "cause-effect": {
+      "__none__": 5,
+      "is-a": 0,
+      "part-of": 0,
+      "cause-effect": 0,
+      "related-to": 0
+    },
+    "related-to": {
+      "__none__": 121,
+      "is-a": 0,
+      "part-of": 4,
+      "cause-effect": 1,
+      "related-to": 0
+    }
+  }
+}
