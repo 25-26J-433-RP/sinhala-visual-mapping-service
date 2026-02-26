@@ -65,8 +65,11 @@ class IntelligentMindMapGenerator:
         logger.info(f"Generating intelligent mind map for {len(text)} characters")
         
         # Step 1: Extract entities and concepts using NLP
-        entities = self.nlp_engine.extract_entities(text)
-        entities = [e for e in entities if e.get('importance', 0) >= self.min_node_importance]
+        all_entities = self.nlp_engine.extract_entities(text)
+        entities = [e for e in all_entities if e.get('importance', 0) >= self.min_node_importance]
+        if len(entities) < 6 and len(all_entities) > len(entities):
+            relaxed_target = max(6, min(14, len(all_entities)))
+            entities = all_entities[:relaxed_target]
         logger.info(f"Extracted {len(entities)} entities")
         
         # Step 2: Extract key phrases for additional concepts
@@ -89,8 +92,13 @@ class IntelligentMindMapGenerator:
                 cluster_map[entity['text']] = idx
         
         # Step 4: Extract relationships between entities
-        relationships = self.nlp_engine.extract_relationships(text, entities)
-        relationships = [r for r in relationships if r['confidence'] >= rel_threshold]
+        raw_relationships = self.nlp_engine.extract_relationships(text, entities)
+        relationships = [r for r in raw_relationships if r['confidence'] >= rel_threshold]
+        if not relationships and raw_relationships:
+            relaxed_rel_threshold = max(0.26, rel_threshold - 0.15)
+            relationships = [
+                r for r in raw_relationships if r.get('confidence', 0.0) >= relaxed_rel_threshold
+            ]
         logger.info(f"Found {len(relationships)} relationships")
 
         # Step 4b: Extract structured enumerations (phases, examples, requirements)
