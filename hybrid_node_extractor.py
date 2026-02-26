@@ -192,6 +192,38 @@ class HybridNodeExtractor:
     _RULE_GATE: float = 0.20       # minimum rule score to enter the pipeline
     _MIN_CONFIDENCE: float = 0.35  # minimum final confidence to keep a node
 
+    _NOISE_RULE_GATE_OFFSET: Dict[str, float] = {
+        'clean': -0.02,
+        'medium': 0.00,
+        'noisy': 0.05,
+    }
+    _NOISE_MIN_CONF_OFFSET: Dict[str, float] = {
+        'clean': -0.02,
+        'medium': 0.00,
+        'noisy': 0.06,
+    }
+    _DOMAIN_RULE_GATE_OFFSET: Dict[str, float] = {
+        'education': -0.01,
+        'science': 0.00,
+        'environment': 0.01,
+        'health': 0.00,
+        'society': 0.01,
+    }
+    _DOMAIN_MIN_CONF_OFFSET: Dict[str, float] = {
+        'education': -0.01,
+        'science': 0.00,
+        'environment': 0.01,
+        'health': 0.00,
+        'society': 0.01,
+    }
+
+    # Continuous quality-driven calibration (beyond discrete bucket offsets)
+    _NOISE_SCORE_MIN_CONF_WEIGHT: float = 0.16
+    _NOISE_SCORE_RULE_GATE_WEIGHT: float = 0.08
+    _ENTROPY_RISK_MIN_CONF_WEIGHT: float = 0.08
+    _ENTROPY_RISK_RULE_GATE_WEIGHT: float = 0.03
+    _ENTROPY_TARGET: float = 0.62
+
     def __init__(self, nlp_engine: Any) -> None:
         """
         Parameters
@@ -234,19 +266,26 @@ class HybridNodeExtractor:
         if not text or not text.strip():
             return []
 
+        profile = self.engine.assess_text_bucket(text)
+        domain = profile.get('domain', 'society')
+        rule_gate, min_confidence = self._calibrate_thresholds(text, profile=profile)
+
         # 1 ── Rule layer: generate candidates
-        candidates = self._rule_extract(text)
+        candidates = self._rule_extract(text, rule_gate=rule_gate, domain=domain)
         if not candidates:
             return []
 
         # 2 ── Embedding layer: semantic plausibility scoring
         self._score_with_embeddings(candidates)
 
+        # 2.5 ── Pre-ranking lemma/root dedupe (reduce inflectional variants)
+        candidates = self._dedupe_by_root_before_ranking(candidates)
+
         # 3 ── Re-ranker: combine signals
         ranked = self._rerank(candidates)
 
         # 4 ── Filter & deduplicate
-        ranked = [c for c in ranked if c["confidence"] >= self._MIN_CONFIDENCE]
+        ranked = [c for c in ranked if c["confidence"] >= min_confidence]
         ranked = self._deduplicate(ranked)
 
         return ranked[:max_nodes]
@@ -255,7 +294,7 @@ class HybridNodeExtractor:
     # Stage 1 – Rule extraction
     # =========================================================================
 
-    def _rule_extract(self, text: str) -> List[Dict[str, Any]]:
+    def _rule_extract(self, text: str, rule_gate: float, domain: str) -> List[Dict[str, Any]]:
         """
         Produce concept candidates from rule-based sources.
 
@@ -288,13 +327,14 @@ class HybridNodeExtractor:
                     or word in engine.action_verbs
                     or word in engine.weak_words
                     or _VERB_ENDING_RE.search(word)
+                    or engine.is_domain_negative_term(word, domain)
                 ):
                     continue
 
                 rule_score = self._single_word_rule_score(
                     word, sentence, idx, n, freq_map, df_map, total_sents
                 )
-                if rule_score >= self._RULE_GATE:
+                if rule_score >= rule_gate:
                     self._upsert(
                         candidates, word, sentence, sent_start,
                         "concept", rule_score, freq_map, text
@@ -309,6 +349,8 @@ class HybridNodeExtractor:
                     phrase = " ".join(words[i:j])
                     if engine._is_stop_phrase(phrase):
                         continue
+                    if engine.is_domain_negative_phrase(phrase, domain):
+                        continue
                     rule_score = engine._calculate_phrase_importance(phrase, text)
                     # Boost when the tail word carries a noun suffix
                     if _NOUN_SUFFIX_RE.search(words[j - 1]):
@@ -319,7 +361,7 @@ class HybridNodeExtractor:
                         if re.search(pattern, phrase_lower):
                             rule_score = min(1.0, rule_score + 0.10)
                             break
-                    if rule_score >= self._RULE_GATE:
+                    if rule_score >= rule_gate:
                         self._upsert(
                             candidates, phrase, sentence, sent_start,
                             "concept_phrase", rule_score, freq_map, text
@@ -336,12 +378,13 @@ class HybridNodeExtractor:
                         for comp in components:
                             if (comp not in engine.stop_words and 
                                 len(comp) >= 3 and 
-                                comp not in engine.weak_words):
+                                comp not in engine.weak_words and
+                                not engine.is_domain_negative_term(comp, domain)):
                                 # Assign moderate rule score for compound components
                                 rule_score = 0.35
                                 if _NOUN_SUFFIX_RE.search(comp):
                                     rule_score = min(1.0, rule_score + 0.10)
-                                if rule_score >= self._RULE_GATE:
+                                if rule_score >= rule_gate:
                                     self._upsert(
                                         candidates, comp, sentence, sent_start,
                                         "compound_component", rule_score, freq_map, text
@@ -360,6 +403,83 @@ class HybridNodeExtractor:
         self._add_sinling_chunks(text, candidates, freq_map)
 
         return list(candidates.values())
+
+    def _calibrate_thresholds(
+        self,
+        text: str,
+        profile: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[float, float]:
+        """
+        Calibrate node rule/confidence gates by domain + text quality.
+
+        Uses:
+        - discrete domain/noise-bucket offsets,
+        - continuous OCR-noise score from ``assess_text_bucket``,
+        - token-entropy risk (very low or very high entropy raises caution).
+        """
+        if profile is None:
+            profile = self.engine.assess_text_bucket(text)
+        domain = profile.get('domain', 'society')
+        noise_bucket = profile.get('noise_bucket', 'medium')
+        noise_score = float(profile.get('noise_score', 0.0) or 0.0)
+        entropy = self._token_entropy(text)
+        entropy_risk = self._entropy_risk(entropy)
+
+        rule_gate = self._RULE_GATE
+        rule_gate += self._NOISE_RULE_GATE_OFFSET.get(noise_bucket, 0.0)
+        rule_gate += self._DOMAIN_RULE_GATE_OFFSET.get(domain, 0.0)
+        rule_gate += self._NOISE_SCORE_RULE_GATE_WEIGHT * max(0.0, min(1.0, noise_score))
+        rule_gate += self._ENTROPY_RISK_RULE_GATE_WEIGHT * entropy_risk
+
+        min_conf = self._MIN_CONFIDENCE
+        min_conf += self._NOISE_MIN_CONF_OFFSET.get(noise_bucket, 0.0)
+        min_conf += self._DOMAIN_MIN_CONF_OFFSET.get(domain, 0.0)
+        min_conf += self._NOISE_SCORE_MIN_CONF_WEIGHT * max(0.0, min(1.0, noise_score))
+        min_conf += self._ENTROPY_RISK_MIN_CONF_WEIGHT * entropy_risk
+
+        rule_gate = max(0.15, min(0.45, rule_gate))
+        min_conf = max(0.25, min(0.60, min_conf))
+
+        logger.debug(
+            "HybridNodeExtractor calibrated thresholds: domain=%s noise_bucket=%s noise_score=%.3f entropy=%.3f entropy_risk=%.3f rule_gate=%.3f min_conf=%.3f",
+            domain,
+            noise_bucket,
+            noise_score,
+            entropy,
+            entropy_risk,
+            rule_gate,
+            min_conf,
+        )
+        return rule_gate, min_conf
+
+    def _token_entropy(self, text: str) -> float:
+        """Return normalized token entropy in [0,1] from Sinhala-aware tokens."""
+        tokens = [self.engine._normalize_term(t) for t in self.engine._tokenize(text)]
+        tokens = [t for t in tokens if t and t not in self.engine.stop_words and len(t) >= 2]
+        if len(tokens) < 2:
+            return 0.0
+
+        freq = Counter(tokens)
+        total = float(len(tokens))
+        probs = [c / total for c in freq.values()]
+        entropy = -sum(p * math.log2(p) for p in probs if p > 0.0)
+        max_entropy = math.log2(max(2, len(freq)))
+        if max_entropy <= 0.0:
+            return 0.0
+        return float(max(0.0, min(1.0, entropy / max_entropy)))
+
+    def _entropy_risk(self, entropy: float) -> float:
+        """
+        Convert normalized entropy into a risk score in [0,1].
+
+        Mid-range entropy is treated as healthier. Extremely low (repetitive)
+        or very high (fragmented/noisy) entropy increases risk.
+        """
+        target = self._ENTROPY_TARGET
+        if target <= 0.0:
+            return 0.0
+        risk = abs(entropy - target) / target
+        return float(max(0.0, min(1.0, risk)))
 
     # =========================================================================
     # Stage 2 – Embedding similarity
@@ -586,6 +706,71 @@ class HybridNodeExtractor:
                         )
         except Exception:
             pass  # Sinling is optional
+
+    def _dedupe_by_root_before_ranking(
+        self,
+        candidates: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Collapse near-duplicate inflectional variants before ranking.
+
+        Groups candidates by a morphology-derived root signature and keeps
+        the strongest representative per group (rule + embed + frequency),
+        with a slight preference for richer phrases.
+        """
+        if not candidates:
+            return []
+
+        grouped: Dict[str, Dict[str, Any]] = {}
+        for cand in candidates:
+            sig = self._root_signature(cand)
+            current = grouped.get(sig)
+            if current is None:
+                grouped[sig] = cand
+                continue
+
+            best = self._select_stronger_candidate(current, cand)
+            grouped[sig] = best
+
+        return list(grouped.values())
+
+    def _root_signature(self, candidate: Dict[str, Any]) -> str:
+        """Build a stable root/lemma signature for a candidate phrase."""
+        text = candidate.get("text", "")
+        normalized = candidate.get("normalized") or self.engine._normalize_term(text)
+        if not normalized:
+            normalized = text
+
+        if not MORPHOLOGY_AVAILABLE:
+            return normalized
+
+        parts = [p for p in normalized.split() if p]
+        roots: List[str] = []
+        for part in parts:
+            lemma = self.engine.morphology.get_citation_form(part)
+            root = normalize_sinhala_word(lemma or part)
+            roots.append(root or lemma or part)
+        return " ".join(roots) if roots else normalized
+
+    def _select_stronger_candidate(
+        self,
+        a: Dict[str, Any],
+        b: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Pick the stronger representative among two root-equivalent candidates."""
+        score_a = (
+            0.60 * float(a.get("rule_score", 0.0))
+            + 0.25 * float(a.get("embed_score", 0.5))
+            + 0.15 * min(1.0, math.log1p(float(a.get("frequency", 1.0))) / math.log1p(8.0))
+            + (0.02 if " " in str(a.get("text", "")) else 0.0)
+        )
+        score_b = (
+            0.60 * float(b.get("rule_score", 0.0))
+            + 0.25 * float(b.get("embed_score", 0.5))
+            + 0.15 * min(1.0, math.log1p(float(b.get("frequency", 1.0))) / math.log1p(8.0))
+            + (0.02 if " " in str(b.get("text", "")) else 0.0)
+        )
+        return a if score_a >= score_b else b
 
     def _deduplicate(self, ranked: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """

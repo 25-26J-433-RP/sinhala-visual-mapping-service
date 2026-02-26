@@ -302,6 +302,10 @@ class SinhalaNLPEngine:
         self.disambiguation_domains = self._load_corpus_tuned_disambiguation_domains(
             self.base_disambiguation_domains
         )
+        self.global_negative_lexicon: Set[str] = set()
+        self.domain_negative_lexicons = self._load_domain_negative_lexicons(
+            self.disambiguation_domains
+        )
         self.ambiguous_term_domains = self._build_ambiguous_term_domains(
             self.disambiguation_domains
         )
@@ -1492,6 +1496,49 @@ class SinhalaNLPEngine:
         except Exception:
             return text
 
+    def assess_text_bucket(self, text: str, topic: str = '') -> Dict[str, Any]:
+        """
+        Estimate domain + noise profile for threshold calibration.
+
+        Returns
+        -------
+        Dict[str, Any]
+            {
+              "domain": str,
+              "noise_score": float,
+              "noise_bucket": "clean"|"medium"|"noisy"
+            }
+        """
+        norm = self._normalize_unicode(text or '')
+        domain = self._infer_domain_from_topic(topic or '', norm)
+
+        total = max(1, len(norm))
+        sinhala_chars = len(re.findall(r'[\u0D80-\u0DFF]', norm))
+        latin_chars = len(re.findall(r'[A-Za-z]', norm))
+        digit_chars = len(re.findall(r'\d', norm))
+        punctuation_noise = sum(1 for ch in norm if ch in '~`@#$%^&*_+=<>|/\\')
+
+        non_sinhala_ratio = 1.0 - (sinhala_chars / total)
+        noise_score = (
+            (0.55 * non_sinhala_ratio)
+            + (0.25 * (latin_chars / total))
+            + (0.12 * (digit_chars / total))
+            + (0.08 * (punctuation_noise / total))
+        )
+
+        if noise_score < 0.06:
+            noise_bucket = 'clean'
+        elif noise_score < 0.12:
+            noise_bucket = 'medium'
+        else:
+            noise_bucket = 'noisy'
+
+        return {
+            'domain': domain,
+            'noise_score': round(float(noise_score), 4),
+            'noise_bucket': noise_bucket,
+        }
+
     def context_disambiguation_score(self, term: str, context: str) -> float:
         """
         Context-sensitive entity disambiguation score in [0,1].
@@ -1614,6 +1661,131 @@ class SinhalaNLPEngine:
             {k: len(v) for k, v in domains.items()},
         )
         return domains
+
+    def _load_domain_negative_lexicons(
+        self,
+        concept_domains: Dict[str, Set[str]],
+    ) -> Dict[str, Set[str]]:
+        """
+        Learn domain-specific high-frequency non-concept lexicons from corpus.
+
+        These terms are used as negative filters in node extraction to reduce
+        high-frequency discourse/helper noise that is not concept-bearing.
+        """
+        domain_neg: Dict[str, Set[str]] = {d: set() for d in concept_domains}
+
+        candidate_files = [
+            Path(__file__).resolve().parent.parent / 'scoring-model-training' / 'akura_dataset.csv',
+            Path(__file__).resolve().parent.parent / 'scoring-model-training' / 'sinhala_dataset_final_with_dyslexic.csv',
+            Path(__file__).resolve().parent.parent / 'scoring-model-training' / 'sinhala_dataset_final.csv',
+        ]
+
+        doc_df_by_domain: Dict[str, Counter] = {d: Counter() for d in concept_domains}
+        doc_count_by_domain: Counter = Counter()
+        token_domain_presence: Dict[str, Set[str]] = defaultdict(set)
+
+        for csv_path in candidate_files:
+            if not csv_path.exists():
+                continue
+            try:
+                with open(csv_path, encoding='utf-8') as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        topic = (row.get('essay_topic') or row.get('topic') or '').strip()
+                        text = (row.get('essay_text') or row.get('input_text') or '').strip()
+                        if not text:
+                            continue
+
+                        domain = self._infer_domain_from_topic(topic, text)
+                        if domain not in doc_df_by_domain:
+                            continue
+
+                        doc_count_by_domain[domain] += 1
+
+                        tokens = [
+                            self._normalize_term(t)
+                            for t in re.findall(r'[\u0D80-\u0DFF]{2,}', self._normalize_unicode(text))
+                        ]
+                        unique_tokens = {t for t in tokens if t and len(t) >= 3}
+
+                        for token in unique_tokens:
+                            if token in concept_domains.get(domain, set()):
+                                continue
+                            if self._is_likely_non_concept_token(token):
+                                doc_df_by_domain[domain][token] += 1
+                                token_domain_presence[token].add(domain)
+            except Exception as e:
+                logger.warning("Failed to build domain negative lexicon from %s: %s", csv_path, e)
+
+        for domain, counter in doc_df_by_domain.items():
+            docs = max(1, int(doc_count_by_domain.get(domain, 0)))
+            min_df = max(4, int(docs * 0.05))
+            chosen: List[str] = []
+
+            for token, df in counter.most_common(300):
+                if df < min_df:
+                    continue
+                ratio = df / docs
+                appears_in_domains = len(token_domain_presence.get(token, set()))
+                # Keep globally noisy discourse words or domain-persistent noise.
+                if appears_in_domains >= 3 or ratio >= 0.12:
+                    if token not in concept_domains.get(domain, set()):
+                        chosen.append(token)
+                if len(chosen) >= 120:
+                    break
+
+            domain_neg[domain].update(chosen)
+
+        # Global negatives: words noisy in many domains.
+        self.global_negative_lexicon = {
+            tok for tok, dset in token_domain_presence.items() if len(dset) >= 3
+        }
+
+        logger.info(
+            "Loaded domain negative lexicons: sizes=%s global=%d",
+            {k: len(v) for k, v in domain_neg.items()},
+            len(self.global_negative_lexicon),
+        )
+        return domain_neg
+
+    def _is_likely_non_concept_token(self, token: str) -> bool:
+        """Heuristic filter for discourse/helper tokens that are rarely concepts."""
+        t = self._normalize_term(token)
+        if not t or len(t) <= 2:
+            return True
+        if t in self.stop_words or t in self.postpositions or t in self.connectors:
+            return True
+        if t in self.action_verbs or t in self.weak_words:
+            return True
+        if any(v in t for v in self.verbs_indicators):
+            if any(t.endswith(sfx) for sfx in self.morphology.verb_suffixes):
+                return True
+        return False
+
+    def is_domain_negative_term(self, term: str, domain: str) -> bool:
+        """Return True when a term is likely non-concept for the inferred domain."""
+        t = self._normalize_term(term)
+        if not t:
+            return True
+        if t in self.stop_words or t in self.postpositions or t in self.connectors:
+            return True
+        if t in self.global_negative_lexicon:
+            return True
+        if t in self.domain_negative_lexicons.get(domain, set()):
+            return True
+        lemma = self._normalize_term(self.morphology.get_citation_form(t))
+        if lemma and lemma in self.domain_negative_lexicons.get(domain, set()):
+            return True
+        return False
+
+    def is_domain_negative_phrase(self, phrase: str, domain: str) -> bool:
+        """Phrase-level negative check based on token composition."""
+        tokens = [self._normalize_term(t) for t in self._tokenize(phrase)]
+        tokens = [t for t in tokens if t]
+        if not tokens:
+            return True
+        negatives = sum(1 for t in tokens if self.is_domain_negative_term(t, domain))
+        return (negatives / len(tokens)) >= 0.6
 
     def _infer_domain_from_topic(self, topic: str, text: str) -> str:
         """Infer domain label from essay topic (or early text if topic missing)."""
